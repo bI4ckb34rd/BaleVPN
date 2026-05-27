@@ -80,9 +80,13 @@ jobs:
             bale-signaling-rust/target
             bale-vpn-rust/target
             bale-vpn-android/rust/target
-          key: rust-test-${{ runner.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'lk-signaling-rust/Cargo.toml', 'bale-signaling-rust/Cargo.toml', 'bale-vpn-rust/Cargo.toml') }}
+          # Key on matrix.os, not runner.os: macos-latest (arm64) and
+          # macos-26-intel (x86_64) both report runner.os == "macOS", so a
+          # shared key lets the Intel runner restore the arm64 runner's
+          # ~/.cargo/bin (wrong-arch toolchain → "cargo: command not found").
+          key: rust-test-${{ matrix.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'lk-signaling-rust/Cargo.toml', 'bale-signaling-rust/Cargo.toml', 'bale-vpn-rust/Cargo.toml') }}
           restore-keys: |
-            rust-test-${{ runner.os }}-
+            rust-test-${{ matrix.os }}-
 
       # Core workspace — what every consumer (CLI, Android
       # shim, bale-vpn-rust binary) ultimately links against.
