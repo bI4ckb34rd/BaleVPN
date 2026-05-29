@@ -1,13 +1,12 @@
 # Top-level convenience targets.
 #
-# Mostly the `sync` target — rsync the repo to a remote build host
-# while leaving generated / fetched artefacts behind. Vendored crates
-# (`lktunnel-rust/vendor/`), node_modules, cargo target/ trees, gradle
-# build dirs, native .so/.dylib output and the patches/.cache/ tarball
-# stash are ALL regenerated on the remote by `patches/apply.sh` +
-# `cargo build` + `npm install` + `gradle build`, so shipping them
-# over the wire is bandwidth wasted on stuff the remote will
-# overwrite anyway.
+# Two flavours of work:
+#   * Local build      — `make build` (Rust CLI/host binary) and
+#                         `make android` (Android APK, which itself
+#                         cross-compiles the JNI shim via cargo-ndk).
+#   * Sync to remote   — `make sync REMOTE=user@host:/path` rsyncs the
+#                         repo while excluding generated artefacts the
+#                         remote will regenerate on its own build.
 
 REMOTE  ?=
 SSH_KEY ?=
@@ -32,14 +31,6 @@ RSYNC_FLAGS = -rltzv --delete -e "$(SSH_CMD)" \
     --exclude='**/target/' \
     --exclude='node_modules/' \
     --exclude='**/node_modules/' \
-    --exclude='lktunnel-rust/vendor/' \
-    --exclude='lktunnel-rust/patches/.cache/' \
-    --exclude='bale-vpn-node/build/' \
-    --exclude='bale-vpn-node/dist/' \
-    --exclude='bale-vpn-node/rust/lktunnel-node/*.node' \
-    --exclude='bale-vpn-node/rust/lktunnel-node/index.js' \
-    --exclude='bale-vpn-node/rust/lktunnel-node/index.d.ts' \
-    --exclude='bale-vpn-node/rust/lktunnel-node/npm/' \
     --exclude='bale-vpn-android/**/build/' \
     --exclude='bale-vpn-android/rust/jniLibs/' \
     --exclude='bale-vpn-android/.gradle/' \
@@ -53,13 +44,27 @@ RSYNC_FLAGS = -rltzv --delete -e "$(SSH_CMD)" \
     --exclude='*.swp' \
     --exclude='*.swo'
 
-.PHONY: sync sync-dry help build build-headless apply-patches
+GRADLEW = ./bale-vpn-android/gradlew -p bale-vpn-android
+
+.PHONY: help \
+        build build-headless \
+        android android-debug install-android install-android-debug \
+        clean clean-android clean-rust \
+        sync sync-dry
 
 help:
 	@echo "Build targets (run from anywhere):"
-	@echo "  make build              — apply patches if needed, then build the GUI binary"
-	@echo "  make build-headless     — same, with --no-default-features (no tao/wry)"
-	@echo "  make apply-patches      — just regenerate vendor/ from patched crates"
+	@echo "  make build                   — build the Rust CLI/host binary (release)"
+	@echo "  make build-headless          — same, --no-default-features (no tao/wry)"
+	@echo "  make android                 — build the release APK (assembleRelease)"
+	@echo "  make android-debug           — build the debug APK (assembleDebug)"
+	@echo "  make install-android         — adb-install the release APK"
+	@echo "  make install-android-debug   — adb-install the debug APK"
+	@echo ""
+	@echo "Clean targets:"
+	@echo "  make clean                   — cargo clean + gradle clean + jniLibs"
+	@echo "  make clean-rust              — cargo clean across every Rust workspace"
+	@echo "  make clean-android           — gradle clean + drop bale-vpn-android/rust/jniLibs"
 	@echo ""
 	@echo "Sync targets:"
 	@echo "  make sync REMOTE=user@host:/path [SSH_KEY=~/.ssh/id_ed25519]"
@@ -67,26 +72,47 @@ help:
 	@echo "  make sync-dry REMOTE=user@host:/path [SSH_KEY=…]"
 	@echo "      dry-run, show what would change"
 	@echo ""
-	@echo "Generated artefacts (vendor/, target/, build/) are excluded from"
-	@echo "sync — the remote regenerates them via apply-patches + cargo build."
+	@echo "Generated artefacts (target/, build/, jniLibs/) are excluded from"
+	@echo "sync — the remote regenerates them via cargo build + gradle build."
 
-# Re-emit lktunnel-rust/vendor/ from the registry + patches. Idempotent.
-# Cheap to re-run; `apply.sh` blows away vendor/ before applying.
-apply-patches:
-	cd lktunnel-rust && ./patches/apply.sh
+# ── Rust host/CLI binary (bale-vpn-rust) ──────────────────────────
 
-# `vendor/` is gitignored, so a fresh checkout must run apply.sh
-# before `cargo build` will resolve the [patch.crates-io] paths.
-# Make that automatic: target depends on vendor/, which exists only
-# after apply.sh has run.
-lktunnel-rust/vendor: lktunnel-rust/patches/apply.sh $(wildcard lktunnel-rust/patches/*.patch)
-	cd lktunnel-rust && ./patches/apply.sh
-
-build: lktunnel-rust/vendor
+build:
 	cd bale-vpn-rust && cargo build --release
 
-build-headless: lktunnel-rust/vendor
+build-headless:
 	cd bale-vpn-rust && cargo build --release --no-default-features
+
+# ── Android (Gradle task chain auto-runs cargo-ndk for the JNI .so) ──
+
+android:
+	$(GRADLEW) :androidApp:assembleRelease
+
+android-debug:
+	$(GRADLEW) :androidApp:assembleDebug
+
+install-android:
+	$(GRADLEW) :androidApp:installRelease
+
+install-android-debug:
+	$(GRADLEW) :androidApp:installDebug
+
+# ── Clean ──────────────────────────────────────────────────────────
+
+clean: clean-rust clean-android
+
+clean-rust:
+	cd lk-signaling-rust    && cargo clean
+	cd bale-signaling-rust  && cargo clean
+	cd lktunnel-rust        && cargo clean
+	cd bale-vpn-rust        && cargo clean
+	cd bale-vpn-android/rust && cargo clean
+
+clean-android:
+	$(GRADLEW) clean
+	rm -rf bale-vpn-android/rust/jniLibs
+
+# ── Sync (rsync to remote build host) ──────────────────────────────
 
 sync:
 ifeq ($(REMOTE),)
