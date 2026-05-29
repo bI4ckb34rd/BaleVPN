@@ -147,6 +147,15 @@ jobs:
       # `lktunnel-jni` is the single merged shim (covers what used
       # to be split across `lktunnel-android` + `bale-signaling-
       # android`); produces `liblktunnel_jni.so`.
+      #
+      # Skip on Windows: the shim calls `LkTunnel::attach_tun` /
+      # `detach_tun`, which are `#[cfg(unix)]` in `lktunnel-rust`
+      # (Android targets are *-linux-android, always unix). Linux
+      # + macOS already cover the FFI shape; Windows compile here
+      # would need to either gate every JNI binding or ship Windows
+      # TUN stubs neither of which is useful — Android never runs
+      # on Windows targets.
       - name: cargo build (android jni shim)
+        if: runner.os != 'Windows'
         working-directory: bale-vpn-android/rust
         run: cargo build -p lktunnel-jni --release

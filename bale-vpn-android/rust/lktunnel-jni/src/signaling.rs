@@ -27,7 +27,7 @@ use jni::sys::{jboolean, jint, jlong, jobject, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use lk_signaling::{
     CallDecision, EndReason, IncomingHandler, PeerId,
-    Signaling, SignalingEvent, TokenStore, TunnelHooks,
+    Signaling, SignalingEvent, TokenStore,
 };
 
 // Both `runtime()` and `vm()` live in [`jni_shared`] (process-wide
