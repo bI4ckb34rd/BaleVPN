@@ -46,6 +46,12 @@ pub struct AppState {
     /// Server-mode admission + per-call tracking. Empty when in
     /// client mode (the structures are cheap to keep around).
     pub server: Arc<ServerState>,
+    /// Long-lived activation driver shared across mode swaps.
+    /// Owned here so that `ClientTunnelManager` / `ServerTunnelManager`
+    /// don't drop the WS activation state when they go out of
+    /// scope between modes — the next manager pushes a fresh
+    /// intent and the driver dedupes if it's the same.
+    pub activation: Arc<lktunnel::manager::ActivationDriver<BaleSignaling>>,
 }
 
 pub async fn run(cfg: Resolved) -> Result<(), Box<dyn Error>> {
@@ -94,6 +100,7 @@ pub async fn run_with_shutdown(
     // because run_client immediately re-dials on next iteration.
     let mut cfg = cfg;
     cfg.peer_id = None;
+    let activation = lktunnel::manager::ActivationDriver::new(signaling.clone());
     let state = Arc::new(AppState {
         signaling:   signaling.clone(),
         auth,
@@ -107,6 +114,7 @@ pub async fn run_with_shutdown(
                          persisted.blacklist,
                          persisted.max_clients,
                      ),
+        activation,
     });
 
     // HTTP UI runs for the whole daemon lifetime. Bound to
@@ -273,18 +281,16 @@ async fn run_one_mode(state: &Arc<AppState>, mode: &str)
 async fn teardown_mode(state: &Arc<AppState>) {
     state.client.clear();
     state.server.clear_all().await;
-    state.signaling.set_incoming_handler(Box::new(NoopHandler));
+    state.signaling.tunnel_hooks().set_incoming_handler(Box::new(NoopHandler));
     // Revert the WS rule engine to client semantics on any mode
     // exit. If a prior `run_server` flipped `server_active=true`
     // and we're switching to client (or unsetting mode), the WS
     // would otherwise stay always-on under server semantics.
     //
-    // No call_active push needed — `TunnelInner::teardown` (which
-    // runs on LkTunnel Drop) synthesizes a `Disconnected` event
-    // to the global observer, which is what the signaling lib
-    // listens to. Source of truth for "call_active" is owned by
-    // the signaling + lktunnel pair; apps no longer push it.
-    state.signaling.set_server_active(false);
+    // No activate/deactivate push needed — both managers' Drop
+    // impls deactivate() the signaling impl on tear-down, so by
+    // the time the new mode constructs its manager the WS state
+    // is already in the right place.
 }
 
 /// Incoming-call handler installed between modes (and any time
@@ -317,14 +323,8 @@ impl IncomingHandler for NoopHandler {
 /// privilege needed; portable.
 async fn run_server(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + Sync>> {
     log::info!("server: installing admission handler");
-    // Tell the WS rule engine we're in server semantics — WS
-    // stays up unconditionally (modulo token + user_disconnect)
-    // so we can receive incoming `callReceived` pushes. Without
-    // this, the first accepted call's LK Connected event fires
-    // the global observer → `set_call_active(true)` → client
-    // semantics would tear the WS down → no more incoming
-    // pushes → server effectively dies.
-    state.signaling.set_server_active(true);
+    // server_active=true is auto-pushed by ServerTunnelManager::new
+    // below (and =false in its Drop), so no explicit push here.
 
     let nat_mode = state.cfg.read().await.nat_mode.clone();
     if nat_mode == "kernel" {
@@ -351,132 +351,164 @@ async fn run_server(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
         return Err(format!("unknown --nat-mode: {nat_mode}").into());
     }
 
-    let server_for_handler = state.server.clone();
-    state.signaling.set_incoming_handler(Box::new(AdmissionHandler {
-        server: server_for_handler,
+    // Bring up the server-side tunnel manager. It installs its
+    // own IncomingHandler on signaling (which delegates to our
+    // AdmissionHandler), drains accepted_sessions to build
+    // LkTunnels, and surfaces per-peer Connected / Disconnected
+    // on its `events()` stream.
+    let mgr = lktunnel::manager::ServerTunnelManager::new(
+        state.signaling.clone(),
+        state.activation.clone(),
+    );
+    mgr.set_admission(std::sync::Arc::new(AdmissionDecider {
+        server: state.server.clone(),
     }));
-
-    // SessionReady → build LkTunnel against the LK creds and
-    // hook it into the NAT path. Kernel mode allocates a slot
-    // K from the SNAT pool and opens a per-session `bale<K>`
-    // TUN at `10.8.<K>.1/24`; userspace mode runs an in-process
-    // NAT. Slots are returned on session end.
-    let state_for_events = state.clone();
-    let slots_for_ready  = state.server.clone();
-    let nat_mode_ready   = nat_mode.clone();
-    state.signaling.on_session_ready(Box::new(move |(peer, session)| {
-        let peer_id   = peer.id_str().to_string();
-        let st        = state_for_events.clone();
-        let slots     = slots_for_ready.clone();
-        let nat_mode  = nat_mode_ready.clone();
-        tokio::spawn(async move {
-            log::info!("server: session ready for {peer_id}");
-            let display = st.signaling.fetch_display_name(&peer).await;
-            // Server-role tunnel — auto-warm of the client QUIC
-            // is suppressed at the lktunnel side, so `start_server`
-            // claims the QUIC role uncontested.
-            //
-            // The on_event callback drops the client from
-            // ServerState the moment the LK room reports
-            // Disconnected — without this we'd wait 30s+ for
-            // Bale's CallEnded to arrive over the WS push.
-            let st_for_event   = st.clone();
-            let peer_for_event = peer_id.clone();
-            let tunnel = st.signaling.wrap_incoming_session(
-                session,
-                move |ev: lktunnel::Event| {
-                    log::debug!("lk event: {:?} {}", ev.kind, ev.info);
-                    if matches!(ev.kind, lktunnel::EventKind::Disconnected) {
-                        let st = st_for_event.clone();
-                        let pid = peer_for_event.clone();
-                        tokio::spawn(async move {
-                            log::info!("server: LK room disconnected for {pid} — dropping client");
-                            st.server.remove_client(&pid).await;
-                        });
-                    }
-                },
-            );
-            if let Err(e) = tunnel.await_connected().await {
-                log::warn!("server: LK await_connected failed for {peer_id}: {e}");
-                return;
+    let mut events = mgr.events();
+    let state_for_loop   = state.clone();
+    let nat_mode_for_loop = nat_mode.clone();
+    tokio::spawn(async move {
+        use lktunnel::manager::SessionEvent;
+        use tokio::sync::oneshot;
+        let mut done: std::collections::HashMap<lk_signaling::PeerId, oneshot::Sender<()>> =
+            std::collections::HashMap::new();
+        while let Some(ev) = events.recv().await {
+            match ev {
+                SessionEvent::Connected { peer_id, tunnel } => {
+                    let (tx, rx) = oneshot::channel();
+                    done.insert(peer_id.clone(), tx);
+                    let st       = state_for_loop.clone();
+                    let nat_mode = nat_mode_for_loop.clone();
+                    tokio::spawn(handle_server_session(st, nat_mode, peer_id, tunnel, rx));
+                }
+                SessionEvent::Disconnected { peer_id } => {
+                    if let Some(tx) = done.remove(&peer_id) { let _ = tx.send(()); }
+                }
+                SessionEvent::Failed { peer_id } => {
+                    // Two paths to Failed here:
+                    //   1. Tunnel reached LkTunnel but never
+                    //      hit Connected (handshake error,
+                    //      peer never joined SFU).
+                    //   2. WS CallEnded cancelled a pending
+                    //      admission (the manager's CallEnded
+                    //      handler drops the cancel sender and
+                    //      emits Failed). The UI's pending row
+                    //      needs clearing in this case so it
+                    //      doesn't stay stuck on the user's
+                    //      screen until they resolve it.
+                    log::info!("server: session for {peer_id} failed to connect");
+                    let peer_str = peer_id.id_str().to_string();
+                    let st       = state_for_loop.clone();
+                    tokio::spawn(async move {
+                        st.server.pending_resolve(
+                            &peer_str,
+                            lk_signaling::CallDecision::SilentlyIgnore,
+                        ).await;
+                    });
+                }
             }
-
-            // Allocate a kernel-TUN slot if in kernel mode; on
-            // exhaustion fall back to userspace NAT for this
-            // session (other sessions can still use kernel TUN
-            // once a slot frees).
-            let mut slot_used: Option<u8> = None;
-            let nat_ok = if nat_mode == "kernel" {
-                // Kernel TUN is Unix-only. On non-Unix this arm is
-                // unreachable (config preflight rejects kernel mode), but
-                // it must still compile — fall back to userspace NAT.
-                #[cfg(not(unix))]
-                { let _ = &slots; tunnel.start_server().is_ok() }
-                #[cfg(unix)]
-                {
-                match slots.alloc_kernel_slot() {
-                    Some(k) => {
-                        let name = format!("bale{k}");
-                        let addr = format!("10.8.{k}.1");
-                        match crate::tun::open_server_tun(&name, &addr, 24, 1400) {
-                            Ok(dev) => {
-                                let fd  = dev.into_raw_fd();
-                                let fmt = crate::tun::host_tun_format();
-                                match tunnel.attach_tun_with_format(fd, fmt) {
-                                    Ok(()) => {
-                                        log::info!("server: kernel TUN bale{k} ({addr}/24) attached for {peer_id} (fmt={fmt:?})");
-                                        slot_used = Some(k);
-                                        true
-                                    }
-                                    Err(e) => {
-                                        log::warn!("server: attach_tun bale{k} failed for {peer_id}: {e} — \
-                                                    fallback userspace NAT");
-                                        slots.release_kernel_slot(k);
-                                        unsafe { libc::close(fd); }
-                                        tunnel.start_server().is_ok()
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("server: open bale{k} failed for {peer_id}: {e} — \
-                                            fallback userspace NAT");
-                                slots.release_kernel_slot(k);
-                                tunnel.start_server().is_ok()
-                            }
-                        }
-                    }
-                    None => {
-                        log::warn!("server: kernel TUN pool exhausted — \
-                                    fallback userspace NAT for {peer_id}");
-                        tunnel.start_server().is_ok()
-                    }
-                }
-                }
-            } else {
-                match tunnel.start_server() {
-                    Ok(()) => { log::info!("server: userspace NAT up for {peer_id}"); true }
-                    Err(e) => { log::warn!("server: start_server failed for {peer_id}: {e}"); false }
-                }
-            };
-            if !nat_ok {
-                if let Some(k) = slot_used { slots.release_kernel_slot(k); }
-                return;
-            }
-            st.server.install_client(peer_id, tunnel, display, slot_used).await;
-        });
-    }));
+        }
+        log::info!("server: manager events stream ended");
+    });
 
     // No WS CallEnded teardown path. LK is the sole authority
-    // for "this session is over" — the per-session LkTunnel's
-    // Disconnected event (wired inside the on_session_ready
-    // closure above) fires remove_client. WS-side CallEnded
-    // pushes are intentionally ignored so a transient WS
-    // hiccup (cardinality re-subscribes, brief WS reconnect)
-    // can't drop a live LK session.
+    // for "this session is over" — the per-session handler
+    // observes engine Disconnected directly on the tunnel's
+    // events stream. WS-side CallEnded pushes are intentionally
+    // ignored so a transient WS hiccup (cardinality re-subscribes,
+    // brief WS reconnect) can't drop a live LK session.
 
     log::info!("server: ready — parking until shutdown");
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// Drive one library-provided session. By the time we're spawned
+/// the tunnel has already reached Connected (the library only
+/// emits `SessionEvent::Connected` after the engine transitions
+/// there). We set up NAT, install in the UI map, then park on
+/// the `done` oneshot — the main events loop fires it when it
+/// sees the matching `SessionEvent::Disconnected`.
+async fn handle_server_session(
+    st: Arc<AppState>,
+    nat_mode: String,
+    peer: lk_signaling::PeerId,
+    tunnel: Arc<lktunnel::LkTunnel>,
+    done: tokio::sync::oneshot::Receiver<()>,
+) {
+    let peer_id = peer.id_str().to_string();
+    log::info!("server: session up for {peer_id}");
+    let display = st.signaling.fetch_display_name(&peer).await;
+
+    // Allocate a kernel-TUN slot if in kernel mode; on
+    // exhaustion fall back to userspace NAT for this session
+    // (other sessions can still use kernel TUN once a slot frees).
+    let slots = st.server.clone();
+    let mut slot_used: Option<u8> = None;
+    let nat_ok = if nat_mode == "kernel" {
+        // Kernel TUN is Unix-only. On non-Unix this arm is
+        // unreachable (config preflight rejects kernel mode), but
+        // it must still compile — fall back to userspace NAT.
+        #[cfg(not(unix))]
+        { let _ = &slots; tunnel.start_server().is_ok() }
+        #[cfg(unix)]
+        {
+        match slots.alloc_kernel_slot() {
+            Some(k) => {
+                let name = format!("bale{k}");
+                let addr = format!("10.8.{k}.1");
+                match crate::tun::open_server_tun(&name, &addr, 24, 1400) {
+                    Ok(dev) => {
+                        let fd  = dev.into_raw_fd();
+                        let fmt = crate::tun::host_tun_format();
+                        match tunnel.attach_tun_with_format(fd, fmt) {
+                            Ok(()) => {
+                                log::info!("server: kernel TUN bale{k} ({addr}/24) attached for {peer_id} (fmt={fmt:?})");
+                                slot_used = Some(k);
+                                true
+                            }
+                            Err(e) => {
+                                log::warn!("server: attach_tun bale{k} failed for {peer_id}: {e} — \
+                                            fallback userspace NAT");
+                                slots.release_kernel_slot(k);
+                                unsafe { libc::close(fd); }
+                                tunnel.start_server().is_ok()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("server: open bale{k} failed for {peer_id}: {e} — \
+                                    fallback userspace NAT");
+                        slots.release_kernel_slot(k);
+                        tunnel.start_server().is_ok()
+                    }
+                }
+            }
+            None => {
+                log::warn!("server: kernel TUN pool exhausted — \
+                            fallback userspace NAT for {peer_id}");
+                tunnel.start_server().is_ok()
+            }
+        }
+        }
+    } else {
+        match tunnel.start_server() {
+            Ok(()) => { log::info!("server: userspace NAT up for {peer_id}"); true }
+            Err(e) => { log::warn!("server: start_server failed for {peer_id}: {e}"); false }
+        }
+    };
+    if !nat_ok {
+        if let Some(k) = slot_used { slots.release_kernel_slot(k); }
+        tunnel.disconnect();
+        return;
+    }
+    st.server.install_client(peer_id.clone(), tunnel, display, slot_used).await;
+
+    // Park until the main events loop signals Disconnected for
+    // this peer. Either an `Err` (sender dropped) or `Ok(())`
+    // means the session is over — clean up either way.
+    let _ = done.await;
+    log::info!("server: {peer_id} disconnected");
+    st.server.remove_client(&peer_id).await;
 }
 
 /// Cap on simultaneous kernel-TUN sessions. Each slot consumes a
@@ -490,20 +522,25 @@ pub(crate) const KERNEL_TUN_SLOT_LIMIT: u8 = 254;
 /// IncomingHandler impl. Defers to [`ServerState`] for the
 /// allow/block lookup and parks pending decisions on a
 /// oneshot the UI completes.
-struct AdmissionHandler {
+struct AdmissionDecider {
     server: Arc<ServerState>,
 }
 
 #[async_trait::async_trait]
-impl IncomingHandler for AdmissionHandler {
+impl lk_signaling::IncomingHandler for AdmissionDecider {
     async fn decide(&self, peer: PeerId, display_name: Option<String>) -> CallDecision {
         let peer_str = peer.id_str().to_string();
 
+        // Blocked callers: explicit reject so they see the call
+        // terminate immediately, not after a timeout.
         if self.server.blacklist_list().await.iter().any(|p| p == &peer_str) {
-            return CallDecision::SilentlyIgnore;
+            log::info!("server: rejecting blacklisted {peer_str}");
+            return CallDecision::Reject;
         }
+        // Capacity rejection stays silent — caller is free to
+        // re-dial once a slot frees up.
         if self.server.client_count().await >= self.server.max_clients() as usize {
-            log::info!("server: at capacity — rejecting {peer_str}");
+            log::info!("server: at capacity — silently ignoring {peer_str}");
             return CallDecision::SilentlyIgnore;
         }
         if self.server.admission_list().await.iter().any(|p| p == &peer_str) {
@@ -531,12 +568,9 @@ impl IncomingHandler for AdmissionHandler {
 }
 
 async fn run_client(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Defensive: ensure the WS rule engine is in client semantics.
-    // `teardown_mode` already does this between mode switches, but
-    // pushing again here is cheap and makes the entry point
-    // self-consistent — anyone calling run_client gets client
-    // semantics regardless of what came before.
-    state.signaling.set_server_active(false);
+    // No server-active push needed — the previous mode's manager
+    // Drop already deactivated. The ClientTunnelManager
+    // constructed below activates with client semantics.
 
     let (peer_id_str, socks5_port, client_tun) = {
         let cfg = state.cfg.read().await;
@@ -552,57 +586,80 @@ async fn run_client(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
     let peer = state.signaling.resolve_peer(&peer_id_str).await
         .ok_or("client: unknown peer (resolve_peer returned None)")?;
 
-    // LK Disconnected → notify the parked run_client via a
-    // oneshot so it tears down the session immediately. The
-    // tunnel construction goes through the signaling library
-    // so the LK lifecycle is auto-wired to set_call_active —
-    // WS pauses while the call is up, no app-side WS control
-    // needed.
+    // Tunnel lifecycle → notify the parked run_client via a
+    // oneshot. LK is the sole authority: a `Disconnected` from
+    // the manager's events stream means the session ended.
+    // We do NOT subscribe to WS CallEnded — the manager itself
+    // applies the "WS callEnded for our peer pre-LK → tear
+    // down the dial; post-LK → ignore" rule centrally, so a
+    // WS hiccup during a live session can't drop us. Pre-LK
+    // WS rejections still surface here as `SessionEvent::
+    // Failed` from the manager (the manager's CallEnded
+    // handler disconnects the in-flight tunnel and the
+    // watcher emits Failed since `entered=false`).
     let (lk_done_tx, lk_done_rx) = tokio::sync::oneshot::channel::<()>();
     let lk_done_tx = Arc::new(std::sync::Mutex::new(Some(lk_done_tx)));
-
-    // WS-driven early-teardown for any CallEnded targeting our
-    // peer. We don't have a confirmed mapping from Bale's
-    // discardReason codes to EndReason::Rejected (the mapper
-    // returns Other(code) for everything), so we can't filter
-    // by reason — the peer match alone is enough: a CallEnded
-    // for the specific peer we dialled is the server's
-    // authoritative "this call is over" signal. Reason is
-    // logged for visibility.
-    let peer_id_str_for_cb = peer.id_str().to_string();
-    let lk_done_for_reject = Arc::clone(&lk_done_tx);
-    state.signaling.on_call_ended(Box::new(move |(p, reason)| {
-        if p.id_str() == peer_id_str_for_cb {
-            if let Some(tx) = lk_done_for_reject.lock().expect("lk_done lock").take() {
-                log::info!("client: WS callEnded for our peer (reason={reason:?}) — tearing down");
-                let _ = tx.send(());
-            }
-        }
-    }));
-
     let lk_done_for_lk = Arc::clone(&lk_done_tx);
-    let tunnel = match state.signaling
-        .place_call_with_tunnel(peer, move |ev: lktunnel::Event| {
-            log::debug!("lk event: {:?} {}", ev.kind, ev.info);
-            if matches!(ev.kind, lktunnel::EventKind::Disconnected) {
-                if let Some(tx) = lk_done_for_lk.lock().expect("lk_done lock").take() {
-                    log::info!("client: LK tunnel disconnected — tearing down session");
-                    let _ = tx.send(());
-                }
-            }
-        })
-        .await
-    {
-        Ok(t)                                  => t,
+
+    // Bring up the client tunnel manager + subscribe to its
+    // events stream BEFORE placing the call so the Connected
+    // event can't be missed (sender installs on the first
+    // `events()` call; the manager's internal watcher emits
+    // Connected as soon as the engine reaches it, which is
+    // potentially within the same task tick on a fast path).
+    let mgr = lktunnel::manager::ClientTunnelManager::new(
+        state.signaling.clone(),
+        state.activation.clone(),
+    );
+    let mut mgr_events = mgr.events();
+
+    match mgr.place_call(peer.clone()).await {
+        Ok(())                                 => {}
         Err(PlaceCallError::Rejected)          => return Err("call rejected by peer".into()),
         Err(PlaceCallError::NoPeer)            => return Err("peer never joined (timeout)".into()),
         Err(PlaceCallError::NotAuthenticated)  => return Err("not authenticated".into()),
         Err(PlaceCallError::Transport(s))      => return Err(format!("transport: {s}").into()),
-    };
+    }
     log::info!("client: call placed, joining LK room");
-    tunnel.await_connected().await
-        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+
+    // Wait for Connected matching our peer. `Failed` for our peer
+    // means the dial never landed (pure-LK failure OR pre-LK WS
+    // CallEnded — the manager funnels both through `Failed`).
+    use lktunnel::manager::SessionEvent;
+    let tunnel = loop {
+        match mgr_events.recv().await {
+            Some(SessionEvent::Connected { peer_id, tunnel }) if peer_id == peer => break tunnel,
+            Some(SessionEvent::Failed { peer_id }) if peer_id == peer =>
+                return Err("LK failed to connect".into()),
+            Some(SessionEvent::Disconnected { peer_id }) if peer_id == peer =>
+                return Err("LK disconnected before connect".into()),
+            Some(_) => continue,
+            None    => return Err("manager events stream closed".into()),
+        }
+    };
     log::info!("client: LK tunnel up");
+
+    // Hold the manager alive past this scope — it's the only
+    // thing keeping the watcher / sender side of `events()`
+    // running. Dropped when the outer client task is cancelled
+    // (which is what we want — it tears the session down).
+    let _mgr_keepalive = mgr;
+
+    // Spawn a watcher that fires lk_done when Disconnected for
+    // our peer arrives on the unified stream.
+    tokio::spawn(async move {
+        while let Some(ev) = mgr_events.recv().await {
+            if let SessionEvent::Disconnected { peer_id } = &ev {
+                if peer_id == &peer {
+                    if let Some(tx) = lk_done_for_lk.lock().expect("lk_done lock").take() {
+                        log::info!("client: LK tunnel disconnected — tearing down session");
+                        let _ = tx.send(());
+                    }
+                    break;
+                }
+            }
+        }
+    });
 
     let bound = tunnel.enable_socks5_server(socks5_port).await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;

@@ -16,12 +16,9 @@ import android.util.Log
 internal object NativeJni {
     private const val TAG = "NativeBridge"
 
-    init {
-        // Triggering LkNative.<clinit> guarantees liblktunnel.so is
-        // loaded, so NativeJni's externs resolve even when LkNative
-        // hasn't been touched yet.
-        LkNative.nativeVersion()
-    }
+    // No `.so` loader priming needed — `LkManagerNative` and
+    // `BaleSignalingNative` both `System.loadLibrary` in their
+    // own `init {}` blocks at app startup.
 
     /** Toggle verbose logging in the native NAT layer. Sticky /
      *  process-wide. Wrapped by [LkTunnel.setDebug]. */

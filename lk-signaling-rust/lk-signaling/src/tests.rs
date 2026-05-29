@@ -4,7 +4,8 @@
 
 use super::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 // ─── Test impl ──────────────────────────────────────────────────────────
 
@@ -18,17 +19,15 @@ impl PeerRef for FakePeer {
 /// the ptr-eq identity invariant; this one does the same with a
 /// `HashMap<String, PeerId>`.
 struct FakeSignaling {
-    peers:        Mutex<HashMap<String, PeerId>>,
-    auth_expired: Mutex<Option<Notify>>,
-    session_ready_cb: Mutex<Option<Callback<(PeerId, TransportSession)>>>,
+    peers:     Mutex<HashMap<String, PeerId>>,
+    events_tx: Mutex<Option<mpsc::UnboundedSender<SignalingEvent>>>,
 }
 
 impl FakeSignaling {
     fn new() -> Self {
         Self {
-            peers:            Mutex::new(HashMap::new()),
-            auth_expired:     Mutex::new(None),
-            session_ready_cb: Mutex::new(None),
+            peers:     Mutex::new(HashMap::new()),
+            events_tx: Mutex::new(None),
         }
     }
 
@@ -44,11 +43,9 @@ impl FakeSignaling {
         p
     }
 
-    /// Helper for tests: simulate an accepted incoming call by
-    /// firing the session-ready callback directly.
-    fn fire_session_ready(&self, peer: PeerId, sess: TransportSession) {
-        if let Some(cb) = self.session_ready_cb.lock().unwrap().as_ref() {
-            cb((peer, sess));
+    fn emit(&self, ev: SignalingEvent) {
+        if let Some(tx) = self.events_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(ev);
         }
     }
 }
@@ -60,26 +57,16 @@ impl Signaling for FakeSignaling {
     async fn disconnect(&self) {}
     async fn sign_out(&self) {}
 
-    fn is_authenticated(&self) -> bool { true }
-    fn on_auth_expired(&self, cb: Notify) {
-        *self.auth_expired.lock().unwrap() = Some(cb);
+    fn events(&self) -> mpsc::UnboundedReceiver<SignalingEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.events_tx.lock().unwrap() = Some(tx);
+        rx
     }
-    fn on_protocol_obsolete(&self, _: Notify) {}
+
+    fn is_authenticated(&self) -> bool { true }
     async fn whoami(&self) -> Option<PeerId> { Some(self.intern("self")) }
 
-    async fn place_call(&self, peer: PeerId) -> Result<TransportSession, PlaceCallError> {
-        Ok(TransportSession {
-            url:     "wss://fake".into(),
-            token:   "fake-token".into(),
-            peer_id: peer,
-        })
-    }
-    fn on_call_ended(&self, _: Callback<(PeerId, EndReason)>) {}
-
-    fn set_incoming_handler(&self, _: Box<dyn IncomingHandler>) {}
-    fn on_session_ready(&self, cb: Callback<(PeerId, TransportSession)>) {
-        *self.session_ready_cb.lock().unwrap() = Some(cb);
-    }
+    fn tunnel_hooks(&self) -> &dyn TunnelHooks { self }
 
     async fn list_contacts(
         &self,
@@ -89,7 +76,6 @@ impl Signaling for FakeSignaling {
     ) -> Result<ContactPage, SignalingError> {
         Ok(ContactPage::default())
     }
-    fn on_contacts_changed(&self, _: Notify) {}
     async fn search_contact_by_phone(&self, _: &str) -> Result<Vec<PeerId>, SignalingError> {
         Err(SignalingError::NotSupported)
     }
@@ -103,6 +89,24 @@ impl Signaling for FakeSignaling {
     fn peer_display_name(&self, _: &PeerId) -> Option<String> { None }
     async fn fetch_display_name(&self, _: &PeerId) -> Option<String> { None }
     async fn resolve_peer(&self, s: &str) -> Option<PeerId> { Some(self.intern(s)) }
+}
+
+#[async_trait::async_trait]
+impl TunnelHooks for FakeSignaling {
+    async fn place_call(&self, peer: PeerId) -> Result<TransportSession, PlaceCallError> {
+        Ok(TransportSession {
+            url:     "wss://fake".into(),
+            token:   "fake-token".into(),
+            peer_id: peer,
+        })
+    }
+    fn set_incoming_handler(&self, _: Box<dyn IncomingHandler>) {}
+    fn accepted_sessions(&self) -> mpsc::UnboundedReceiver<(PeerId, TransportSession)> {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        rx
+    }
+    fn activate  (&self) {}
+    fn deactivate(&self) {}
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -119,16 +123,12 @@ fn peer_id_display_round_trips_through_id_str() {
 fn peer_id_equality_is_ptr_eq() {
     let a = PeerId::new(FakePeer { id: "x".into() });
     let b = PeerId::new(FakePeer { id: "x".into() });   // same id, different Arc
-    // Different Arcs → not equal, even though id_str matches. This
-    // is the documented invariant: identity is by Arc, not by
-    // string contents.
     assert_ne!(a, b);
     assert_eq!(a, a.clone());
 }
 
 #[tokio::test]
 async fn resolve_peer_returns_same_handle_for_same_id() {
-    // The cache-by-id invariant the trait documents.
     let s = FakeSignaling::new();
     let a = s.resolve_peer("42").await.unwrap();
     let b = s.resolve_peer("42").await.unwrap();
@@ -170,37 +170,12 @@ async fn incoming_handler_decide_basic() {
 }
 
 #[tokio::test]
-async fn session_ready_callback_receives_the_session() {
+async fn events_stream_carries_emitted_events() {
     let s = FakeSignaling::new();
-    let captured: Arc<Mutex<Option<(PeerId, TransportSession)>>> = Arc::new(Mutex::new(None));
-    let captured_cb = captured.clone();
-    s.on_session_ready(Box::new(move |(peer, sess)| {
-        *captured_cb.lock().unwrap() = Some((peer, sess));
-    }));
-
-    let p = s.resolve_peer("incoming-42").await.unwrap();
-    let session = TransportSession {
-        url:     "wss://server".into(),
-        token:   "tok".into(),
-        peer_id: p.clone(),
-    };
-    s.fire_session_ready(p.clone(), session);
-
-    let got = captured.lock().unwrap().clone();
-    let (got_peer, got_sess) = got.expect("callback should have fired");
-    assert_eq!(got_peer, p);
-    assert_eq!(got_sess.url,   "wss://server");
-    assert_eq!(got_sess.token, "tok");
-}
-
-#[tokio::test]
-async fn auth_expired_callback_installs() {
-    let s = FakeSignaling::new();
-    let fired = Arc::new(Mutex::new(false));
-    let fired_cb = fired.clone();
-    s.on_auth_expired(Box::new(move || { *fired_cb.lock().unwrap() = true; }));
-    s.auth_expired.lock().unwrap().as_ref().unwrap()();
-    assert!(*fired.lock().unwrap());
+    let mut rx = s.events();
+    s.emit(SignalingEvent::AuthExpired);
+    let ev = rx.recv().await.expect("events stream should emit");
+    assert!(matches!(ev, SignalingEvent::AuthExpired));
 }
 
 #[tokio::test]

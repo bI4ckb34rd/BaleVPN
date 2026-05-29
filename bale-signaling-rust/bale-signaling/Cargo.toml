@@ -14,20 +14,6 @@ crate-type = ["lib"]
 # together without publishing.
 lk-signaling = { path = "../../lk-signaling-rust/lk-signaling" }
 
-# LiveKit transport. Optional — enabling it lets `BaleSignaling`
-# own LK-tunnel construction (`place_call_with_tunnel` returns
-# `Arc<LkTunnel>`) and installs a process-wide LK observer that
-# auto-flips the WS rule engine's `call_active` flag.
-#
-# Why optional: enabling this transitively pulls libwebrtc into
-# whatever links bale-signaling. On Android there are TWO JNI
-# .so files in the same process (libbale_signaling.so +
-# liblktunnel.so); both linking libwebrtc trips fdsan on stdout
-# ownership (RTC_LOG fdopens fd 1 twice). The Android shim
-# leaves this feature OFF and uses explicit `set_call_active`
-# calls from Kotlin. The Rust binary (single .so) turns it ON.
-lktunnel = { path = "../../lktunnel-rust/lktunnel", optional = true }
-
 async-trait = "0.1"
 tokio       = { version = "1", features = [
     "rt-multi-thread", "sync", "macros", "time", "io-util", "net",
@@ -68,14 +54,6 @@ parking_lot = "0.12"
 # `futures_util::{SinkExt, StreamExt}` for splitting the WS stream
 # and writing to it. Tiny dep, no async runtime tie-in.
 futures-util = { version = "0.3", default-features = false }
-
-[features]
-default  = []
-# Enable LK-aware methods: `place_call_with_tunnel`,
-# `wrap_incoming_session`, and the auto-installed global LK
-# observer in `BaleSignaling::new`. See the dep comment on
-# `lktunnel` above for why this isn't on by default.
-lktunnel = ["dep:lktunnel"]
 
 [dev-dependencies]
 env_logger = "0.11"

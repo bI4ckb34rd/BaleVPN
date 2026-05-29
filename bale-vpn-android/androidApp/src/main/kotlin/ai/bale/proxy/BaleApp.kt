@@ -10,8 +10,10 @@ import androidx.lifecycle.ProcessLifecycleOwner
 
 private const val TAG = "BaleProxy"
 
-/** Pushes app-process foreground state into the Rust WS rule engine
- *  via BaleSignaling.setForeground. */
+/** Pushes app-process foreground state into the signaling
+ *  impl. Bale's WS rule engine consumes it; the lktunnel
+ *  managers also read through `signaling.foreground()` if their
+ *  decision depends on it. */
 class BaleApp : Application() {
     override fun onCreate() {
         super.onCreate()
@@ -23,18 +25,13 @@ class BaleApp : Application() {
         // namespace, dlopen on the Rust .so fails with
         // "cannot locate symbol lktunnel_inject_packet".
         //
+        // BaleConnection.init constructs LkManagerNative + the
+        // BaleSignaling JNI bridge; both `System.loadLibrary` in
+        // their own `init {}` blocks, so the `.so` is up by the
+        // time onCreate returns.
         BaleConnection.init(this)
         installMainLoopCrashRecovery()
         installNativeErrorPoller()
-        // Single load-time sanity check — the LK runtime and NAT
-        // dispatcher both live in `liblktunnel.so`; one version
-        // probe confirms the .so loaded and the JNI symbols
-        // resolved.
-        try {
-            Log.i(TAG, "Rust shim up: ver=${LkNative.nativeVersion()}")
-        } catch (t: Throwable) {
-            Log.e(TAG, "Rust shim failed to load", t)
-        }
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
                 BaleConnection.signaling?.setForeground(true)

@@ -92,9 +92,9 @@ pub struct TransportSession {
 /// call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallDecision {
-    /// Send the impl's accept message; signaling then fires
-    /// [`Signaling::on_session_ready`] with the resulting
-    /// [`TransportSession`].
+    /// Send the impl's accept message; the impl runs the wire-
+    /// level accept and surfaces the resulting `(peer, transport)`
+    /// pair on [`Signaling::accepted_sessions`].
     Accept,
     /// Send the impl's reject message; caller sees an explicit
     /// rejection.
@@ -127,10 +127,9 @@ impl fmt::Display for PlaceCallError {
 }
 impl std::error::Error for PlaceCallError {}
 
-/// Why a session ended. Reported by [`Signaling::on_call_ended`]
-/// after `place_call` already returned, and applied to server-side
-/// sessions tracked via [`Signaling::on_session_ended`] when the
-/// reason is known.
+/// Why a session ended. Reported on the [`Signaling::events`]
+/// stream as part of [`SignalingEvent::CallEnded`] after the
+/// peer hangs up, the network drops, or the call is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
     Rejected,
@@ -201,13 +200,25 @@ impl fmt::Display for SignalingError {
 }
 impl std::error::Error for SignalingError {}
 
-/// Boxed callback type. All `on_*` events on [`Signaling`] take
-/// owned `Box<dyn Fn>` so impls can stash them in fields without
-/// extra wrapping.
-pub type Callback<T> = Box<dyn Fn(T) + Send + Sync + 'static>;
-
-/// Argument-less variant of [`Callback`].
-pub type Notify = Box<dyn Fn() + Send + Sync + 'static>;
+/// Async events the signaling impl reports to its consumer.
+/// Surfaced on a single stream via [`Signaling::events`] so
+/// consumers subscribe once and pattern-match.
+#[derive(Debug, Clone)]
+pub enum SignalingEvent {
+    /// Token was rejected by the server (or never valid). App
+    /// should clear its [`TokenStore`] and prompt re-auth.
+    AuthExpired,
+    /// Server protocol/version is incompatible with this build.
+    /// Retry won't help — the app needs to be updated.
+    ProtocolObsolete,
+    /// Any call this signaling instance was tracking ended —
+    /// regardless of direction. The app discriminates
+    /// outgoing-vs-incoming from its own per-peer state.
+    CallEnded { peer_id: PeerId, reason: EndReason },
+    /// The impl's backing contact list changed (server push,
+    /// blocked-user removal, etc.). UI should re-fetch.
+    ContactsChanged,
+}
 
 #[async_trait::async_trait]
 pub trait Signaling: Send + Sync {
@@ -223,54 +234,45 @@ pub trait Signaling: Send + Sync {
     /// subsequent [`Self::connect`] reuses the stored token.
     async fn disconnect(&self);
 
-    /// Clear stored credentials and tear down. Next [`Self::connect`]
-    /// will require fresh auth via the impl-specific auth helper.
+    /// Clear stored credentials and tear down. Wakes
+    /// [`TunnelHooks::subscribe_sign_out`] subscribers before
+    /// proceeding so managers can disconnect their sessions
+    /// cleanly first. The WS / control channel comes down as a
+    /// consequence of the auth state going away.
     async fn sign_out(&self);
+
+    /// Stream of async events — auth expired, protocol obsolete,
+    /// call ended, contacts changed. Single-consumer: calling
+    /// again replaces the receiver, no backlog kept for an
+    /// absent consumer.
+    fn events(&self) -> tokio::sync::mpsc::UnboundedReceiver<SignalingEvent>;
 
     // ── Auth state ─────────────────────────────────────────────────
 
     fn is_authenticated(&self) -> bool;
 
-    /// Token was rejected by the server (or never valid). App
-    /// should clear its [`TokenStore`] and prompt re-auth.
-    fn on_auth_expired(&self, cb: Notify);
-
-    /// Server protocol/version is incompatible with this build.
-    /// Retry won't help — the app needs to be updated. Distinct
-    /// from [`Self::on_auth_expired`] because the resolution is
-    /// different (update vs re-login).
-    fn on_protocol_obsolete(&self, cb: Notify);
-
     /// Who we're signed in as. `None` if not authenticated.
     async fn whoami(&self) -> Option<PeerId>;
 
-    // ── Client side ────────────────────────────────────────────────
+    // ── App lifecycle hint ─────────────────────────────────────────
 
-    /// Place a call to `peer`. Returns once the LK room is up and
-    /// ready to join; the peer's accept/reject decision may still
-    /// race and arrive *after* this returns — that case is
-    /// surfaced via [`Self::on_call_ended`] with
-    /// [`EndReason::Rejected`].
-    async fn place_call(&self, peer: PeerId) -> Result<TransportSession, PlaceCallError>;
+    /// App lifecycle (foreground vs background). Apps push this
+    /// from `ProcessLifecycleOwner` (or equivalent). The trait
+    /// doesn't gate the control channel on this directly — the
+    /// lktunnel managers subscribe via
+    /// [`TunnelHooks::subscribe_foreground`] and combine with
+    /// their own state to drive `activate` / `deactivate`.
+    fn set_foreground(&self, _foreground: bool) {}
 
-    /// Fires when any call this signaling instance was tracking
-    /// ends — regardless of direction. The app discriminates
-    /// outgoing-vs-incoming by checking its own per-peer state
-    /// (the same state it built when it called `place_call`
-    /// and / or `on_session_ready` fired).
-    fn on_call_ended(&self, cb: Callback<(PeerId, EndReason)>);
+    // ── Tunnel-manager hooks accessor ──────────────────────────────
 
-    // ── Server side ────────────────────────────────────────────────
-
-    /// Install the handler that decides what to do with each
-    /// incoming call. Replaces any previous handler.
-    fn set_incoming_handler(&self, h: Box<dyn IncomingHandler>);
-
-    /// Fires after an accepted incoming call has produced a usable
-    /// [`TransportSession`]. App constructs the `LkTunnel` from it
-    /// and starts server-side NAT. Session teardown comes through
-    /// [`Self::on_call_ended`].
-    fn on_session_ready(&self, cb: Callback<(PeerId, TransportSession)>);
+    /// Borrow the [`TunnelHooks`] surface for this impl. Apps
+    /// don't normally touch this — it's the internal contract
+    /// the lktunnel managers use to drive the control channel
+    /// lifecycle (`activate`/`deactivate`), drain accepted
+    /// incoming sessions, and react to sign-out + foreground
+    /// changes.
+    fn tunnel_hooks(&self) -> &dyn TunnelHooks;
 
     // ── Contacts ───────────────────────────────────────────────────
     //
@@ -287,11 +289,6 @@ pub trait Signaling: Send + Sync {
         cursor: Option<&str>,
         limit:  usize,
     ) -> Result<ContactPage, SignalingError>;
-
-    /// Fires when the impl's backing contact list changes (server
-    /// push, blocked-user removal, etc.). UI should re-fetch the
-    /// visible pages.
-    fn on_contacts_changed(&self, cb: Notify);
 
     /// Look up peer(s) globally by phone number. Returns 0 or 1
     /// matches (occasionally more for number-collisions across
@@ -336,6 +333,113 @@ pub trait Signaling: Send + Sync {
     /// persisted allow-list). Returns `None` if the impl can't
     /// resolve the string to a known peer.
     async fn resolve_peer(&self, s: &str) -> Option<PeerId>;
+}
+
+// ─── Tunnel-manager hooks ──────────────────────────────────────────────
+
+/// Internal contract between a [`Signaling`] impl and the
+/// lktunnel managers (`ClientTunnelManager` / `ServerTunnelManager`).
+/// Apps don't normally see this — they hand the manager an
+/// `Arc<dyn Signaling>` and the manager grabs the hooks via
+/// [`Signaling::tunnel_hooks`].
+///
+/// Splitting it out of [`Signaling`] keeps the app-facing
+/// surface (auth, contacts, place_call, events) separate from
+/// the manager-only plumbing (activate/deactivate, accepted
+/// session drain, foreground / sign-out subscriptions).
+#[async_trait::async_trait]
+pub trait TunnelHooks: Send + Sync {
+    /// Place a call to `peer`. Returns once the wire-level
+    /// place-call completes (LK creds in hand); the peer's
+    /// accept/reject decision may still race and arrive after
+    /// this returns — that case surfaces on
+    /// [`Signaling::events`] as [`SignalingEvent::CallEnded`]
+    /// with [`EndReason::Rejected`]. The
+    /// [`crate::ClientTunnelManager`](../../lktunnel/manager/struct.ClientTunnelManager.html)
+    /// wraps this; apps don't normally call it directly.
+    async fn place_call(&self, peer: PeerId) -> Result<TransportSession, PlaceCallError>;
+
+    /// Install the handler that decides what to do with each
+    /// incoming call. Replaces any previous handler. After the
+    /// handler returns [`CallDecision::Accept`], the impl runs
+    /// the wire-level accept and surfaces the resulting
+    /// `(peer, transport)` pair on [`Self::accepted_sessions`].
+    /// `ServerTunnelManager` installs its own wrapper here;
+    /// apps install policy via the manager's `set_admission`.
+    fn set_incoming_handler(&self, h: Box<dyn IncomingHandler>);
+
+    /// Stream of accepted incoming sessions. Each fires after
+    /// the impl's [`IncomingHandler`] returned `Accept` and the
+    /// wire-level accept succeeded — `ServerTunnelManager`
+    /// builds the actual transport from the
+    /// [`TransportSession`]. Single-consumer.
+    fn accepted_sessions(&self) -> tokio::sync::mpsc::UnboundedReceiver<(PeerId, TransportSession)>;
+
+    /// "I want the control channel up right now." Paired calls
+    /// from the manager — `activate` when no session is active
+    /// (or, in server mode, always), `deactivate` during a live
+    /// tunnel (client) / on manager drop. Defaults to active
+    /// when no manager has ever pushed.
+    fn activate(&self);
+    fn deactivate(&self);
+
+    /// Subscribe to foreground-state changes. Fires every time
+    /// the app pushes [`Signaling::set_foreground`]; impls
+    /// without app lifecycle hand back a receiver pinned at
+    /// `true`.
+    fn subscribe_foreground(&self) -> tokio::sync::watch::Receiver<bool> {
+        static DEFAULT_FG: once_cell::sync::OnceCell<tokio::sync::watch::Sender<bool>>
+            = once_cell::sync::OnceCell::new();
+        DEFAULT_FG.get_or_init(|| tokio::sync::watch::channel(true).0).subscribe()
+    }
+
+    /// Subscribe to user-initiated teardown events. The value
+    /// is a monotonic counter — both [`Signaling::sign_out`] and
+    /// [`Signaling::disconnect`] increment it. Subscribers wait
+    /// on `changed()` and react: `ServerTunnelManager`
+    /// `disconnect_all()`s its sessions so peers see clean LK
+    /// drops; `ClientTunnelManager` could optionally `hang_up`
+    /// any in-flight call.
+    ///
+    /// Distinct from foreground/background — this fires only on
+    /// explicit user intent (the UI's "Disconnect" / "Sign Out"
+    /// buttons), not on lifecycle transitions.
+    fn subscribe_teardown(&self) -> tokio::sync::watch::Receiver<u64> {
+        static DEFAULT_TD: once_cell::sync::OnceCell<tokio::sync::watch::Sender<u64>>
+            = once_cell::sync::OnceCell::new();
+        DEFAULT_TD.get_or_init(|| tokio::sync::watch::channel(0u64).0).subscribe()
+    }
+
+    /// Manager-internal CallEnded fan-out. Returns a fresh
+    /// multi-subscriber receiver — every call gets its own
+    /// independent stream (no replace-on-subscribe). The
+    /// `ClientTunnelManager` / `ServerTunnelManager` each
+    /// subscribe at construction so they can enforce the
+    /// "LK-is-the-sole-authority once both parties joined the
+    /// room" rule centrally:
+    ///   * client manager: pre-LK CallEnded for the dialed
+    ///     peer → tear the tunnel down (watcher emits `Failed`);
+    ///     post-LK → ignored (a transient WS hiccup must not
+    ///     drop a live session).
+    ///   * server manager: CallEnded for a peer with an active
+    ///     LK session → ignored; for a peer with a pending
+    ///     admission decision → cancel the decision so the
+    ///     app's notification clears.
+    ///
+    /// Distinct from the unified [`Signaling::events`] stream
+    /// (which is single-consumer for app use): subscribers here
+    /// don't interfere with apps that have their own
+    /// `events()` consumer. Impls without call lifecycle return
+    /// the default — an immediately-closed stream that yields
+    /// `None` on first `recv`.
+    fn subscribe_call_ended(&self) -> tokio::sync::mpsc::UnboundedReceiver<(PeerId, EndReason)> {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // `_tx` drops immediately → `rx.recv()` returns `None`
+        // straight away. Impls without call lifecycle (test
+        // doubles, future protocol bridges that don't model
+        // calls) get this freebie.
+        rx
+    }
 }
 
 #[cfg(test)]

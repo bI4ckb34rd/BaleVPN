@@ -14,23 +14,38 @@ import kotlinx.coroutines.launch
 
 private const val TAG = "BaleProxy"
 
+/** Top-level role this app is acting in. Drives which tunnel
+ *  manager is active in [BaleConnection] and therefore which
+ *  semantics the WS uses. Persisted as the lower-case enum name
+ *  in SharedPreferences key `"mode"`. */
+enum class Mode {
+    CLIENT, SERVER;
+    fun storageKey(): String = name.lowercase()
+    companion object {
+        /** Parse from the persisted SharedPreferences value.
+         *  Defaults to [CLIENT] for unknown / null input. */
+        fun fromStorage(s: String?): Mode = when (s?.lowercase()) {
+            "server" -> SERVER
+            else     -> CLIENT
+        }
+    }
+}
+
 /**
  * Process-singleton owning the [BaleSignaling] instance.
  *
- * **The Rust rule engine owns WS lifecycle decisions.** This
- * Kotlin layer just pushes inputs and observes status. Inputs:
- *   - `setForeground(bool)` from `ProcessLifecycleOwner` in `BaleApp`
- *   - `sig.connect()` / `sig.disconnect()` from UI buttons + auth flow
- *   - `set_incoming_handler` from `BaleServerService` (auto-flips
- *     mode to Server on the Rust side)
- *   - LK Connected/Disconnected, observed by the global lktunnel
- *     observer Rust installs in `BaleSignaling::new` — fires
- *     `set_call_active(...)` so WS pauses for the duration of a
- *     call in client mode.
+ * The WS lifecycle is driven by:
+ *   - `signaling.setForeground(bool)` from `BaleApp`'s
+ *     `ProcessLifecycleOwner` observer (consumed by whichever
+ *     tunnel manager is alive — server mode ignores it, client
+ *     mode pauses the WS while backgrounded).
+ *   - `signaling.connect()` / `disconnect()` / `signOut()` from
+ *     UI + auth flow.
+ *   - `signaling.activate()` / `deactivate()` pushed by
+ *     [ClientTunnelManager] / [ServerTunnelManager] from their
+ *     own session-count state.
  *
- * No Kotlin-side rule remains; no reconcile loop, no sticky
- * flags. [connect] / [disconnect] are thin auth-flow helpers
- * that just persist the token and call into the Rust API.
+ * [connect] / [disconnect] here are thin auth-flow helpers.
  */
 object BaleConnection {
 
@@ -38,6 +53,16 @@ object BaleConnection {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     @Volatile var signaling: BaleSignaling? = null
+        private set
+
+    // Process-lived tunnel manager. Exactly one of `clientMgr` /
+    // `serverMgr` is non-null at a time, swapped by [setMode].
+    // The WS-activation driver lives entirely on the native side
+    // (lktunnel-jni's process-singleton), so swapping managers
+    // here doesn't disturb the gate's state.
+    @Volatile var clientMgr: ClientTunnelManager? = null
+        private set
+    @Volatile var serverMgr: ServerTunnelManager? = null
         private set
 
     /** Cached "who am I" pair. Refreshed by [refreshSelfInfoLoop]
@@ -102,13 +127,47 @@ object BaleConnection {
                 // NotAuthenticated; ignored).
                 scope.launch { sig.connect() }
             }
-            // Mirror the Rust binary's global LK observer:
-            // any LkTunnel anywhere in the process flips the WS
-            // rule engine's call_active on Connected/Disconnected.
-            // No per-call wiring needed in BaleVpnService /
-            // BaleServerService.
-            LkTunnel.globalLifecycleObserver = { active ->
-                signaling?.setCallActive(active)
+            // Initial mode — read from prefs (defaults to client).
+            // Construct the matching manager so the foreground/
+            // session gates start driving WS lifecycle from boot.
+            val mode = Mode.fromStorage(
+                appContext.getSharedPreferences("config", Context.MODE_PRIVATE)
+                    .getString("mode", null)
+            )
+            setMode(mode)
+        }
+    }
+
+    /** Swap the active manager. Construct the new one BEFORE
+     *  closing the old so the native-side activation gate
+     *  (process-singleton inside `lktunnel-jni`) bridges across
+     *  the swap — the new manager's mode push lands before the
+     *  old one's Drop, so `desired_up` never momentarily flips
+     *  to false and the WS run loop doesn't flap.
+     *
+     *  `BaleVpnService` / `BaleServerService` read from
+     *  [clientMgr] / [serverMgr] rather than building their own
+     *  so the foreground gate stays wired across service
+     *  start/stop cycles. */
+    @Synchronized
+    fun setMode(mode: Mode) {
+        val sig = signaling ?: return
+        when (mode) {
+            Mode.SERVER -> {
+                if (serverMgr != null) return
+                val newMgr = ServerTunnelManager(sig)
+                val old    = clientMgr
+                serverMgr  = newMgr
+                clientMgr  = null
+                old?.close()
+            }
+            Mode.CLIENT -> {
+                if (clientMgr != null) return
+                val newMgr = ClientTunnelManager(sig)
+                val old    = serverMgr
+                clientMgr  = newMgr
+                serverMgr  = null
+                old?.close()
             }
         }
     }

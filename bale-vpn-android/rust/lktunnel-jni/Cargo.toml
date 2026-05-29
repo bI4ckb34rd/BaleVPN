@@ -1,0 +1,58 @@
+# Merged Android JNI shim. Produces a single `liblktunnel_jni.so`
+# loaded by Kotlin via `System.loadLibrary("lktunnel_jni")`. Owns
+# the JNI surface for both:
+#   * `Java_ai_bale_proxy_{NativeJni,LkTunnelNative,LkManagerNative}_*`
+#     — the lktunnel core (connect, start_server, attach_tun, NAT
+#     dispatcher).
+#   * `Java_ai_bale_proxy_bale_{BaleSignalingNative,BaleAuthNative}_*`
+#     — Bale signaling + auth, plus the SessionEvent stream
+#     subscriber that the merged shim can serve directly (no
+#     cross-`.so` handle bridge needed).
+#
+# Previously two separate cdylibs (`lktunnel-android` +
+# `bale-signaling-android`). The split existed because libwebrtc
+# couldn't be safely linked into two `.so` files in one process;
+# on the pure-Rust webrtc-rs stack that constraint is gone and
+# one `.so` avoids the duplicate library payload in the APK and
+# the cross-shim handle-registry bridge it would have needed.
+[package]
+name        = "lktunnel-jni"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Merged Android JNI bridge for the lktunnel core + bale-signaling."
+
+[lib]
+# Cargo lib names must be valid Rust identifiers, so the underscore
+# form is the artefact name (produces `liblktunnel_jni.so`); Kotlin
+# loads it with `System.loadLibrary("lktunnel_jni")`.
+name       = "lktunnel_jni"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The Rust crates this shim wraps for Kotlin.
+lktunnel       = { path = "../../../lktunnel-rust/lktunnel" }
+lk-signaling   = { path = "../../../lk-signaling-rust/lk-signaling" }
+bale-signaling = { path = "../../../bale-signaling-rust/bale-signaling" }
+jni-shared     = { path = "../jni-shared" }
+
+jni            = "0.21"
+android_logger = "0.13"
+log            = "0.4"
+once_cell      = "1"
+parking_lot    = "0.12"
+async-trait    = "0.1"
+
+# write(2) syscall for the TUN drain path, errno lookup, etc.
+libc           = "0.2"
+# mio is the cross-platform reactor used by `lktunnel`'s dispatcher.
+# The Android TUN fd registers via `mio::unix::SourceFd` so it joins
+# the same event loop as the rest of the lib's sockets.
+mio            = { version = "1", features = ["os-poll", "os-ext"] }
+
+# Tokio runtime for the async signaling RPCs + the session-events
+# subscriber task. Matches the feature set the old
+# bale-signaling-android crate used.
+tokio          = { version = "1", features = [
+    "rt-multi-thread", "sync", "macros", "time",
+] }

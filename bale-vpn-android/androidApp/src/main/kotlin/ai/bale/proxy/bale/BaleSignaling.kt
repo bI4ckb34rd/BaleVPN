@@ -29,32 +29,10 @@ sealed interface EndReason {
     }
 }
 
-/** Decision returned by [BaleIncomingHandler.decide]. */
-sealed interface CallDecision {
-    data object Accept         : CallDecision
-    data object Reject         : CallDecision
-    data object SilentlyIgnore : CallDecision
-}
-
-/** Async admission policy for incoming calls. The wrapper
- *  bridges this to the JNI `JavaIncomingHandler` interface
- *  internally. Implementations may suspend (e.g. to wait on a
- *  notification's Allow / Reject button); the JNI side runs the
- *  call on tokio's blocking pool so a long suspend doesn't pin
- *  the Rust runtime. */
-fun interface BaleIncomingHandler {
-    suspend fun decide(peerId: String, displayName: String?): CallDecision
-}
-
-/** What [BaleSignaling.placeCall] returns. Mirrors the
- *  `PlaceCallError` enum on the Rust side. */
-sealed interface PlaceCallResult {
-    data class Ok(val url: String, val token: String, val peerId: String) : PlaceCallResult
-    data object Rejected         : PlaceCallResult
-    data object NoPeer           : PlaceCallResult
-    data object NotAuthenticated : PlaceCallResult
-    data object Transport        : PlaceCallResult
-}
+// `CallDecision`, `BaleIncomingHandler`, and `PlaceCallResult`
+// moved out of BaleSignaling — admission and outgoing calls
+// live on `ai.bale.proxy.ServerTunnelManager` /
+// `ClientTunnelManager` now.
 
 /** Page of contact peer ids, plus an opaque cursor to fetch the
  *  next page. `nextCursor=null` means the list is exhausted. */
@@ -64,13 +42,11 @@ data class ContactPage(
 )
 
 /** Streaming events from the signaling layer. Collect on the
- *  Main dispatcher to update UI. */
+ *  Main dispatcher to update UI. Accepted incoming sessions are
+ *  reported on the [ServerTunnelManager.events] flow, not here. */
 sealed interface BaleEvent {
     data object AuthExpired      : BaleEvent
     data object ProtocolObsolete : BaleEvent
-    /** Accepted incoming call's LK creds. Server-mode consumers
-     *  build an LkTunnel and start NAT in response. */
-    data class  SessionReady(val peerId: String, val url: String, val token: String) : BaleEvent
     /** Any tracked call (outgoing or incoming) has ended.
      *  Apps disambiguate direction from their own per-peer state. */
     data class  CallEnded   (val peerId: String, val reason: EndReason) : BaleEvent
@@ -113,16 +89,17 @@ class BaleSignaling(
     private val observer = object : BaleSignalingNative.SignalingObserver {
         override fun onAuthExpired()      { emit(BaleEvent.AuthExpired) }
         override fun onProtocolObsolete() { emit(BaleEvent.ProtocolObsolete) }
-        override fun onSessionReady(peerId: String, url: String, token: String) {
-            emit(BaleEvent.SessionReady(peerId, url, token))
-        }
         override fun onCallEnded(peerId: String, endReasonCode: Int) {
             emit(BaleEvent.CallEnded(peerId, EndReason.fromCode(endReasonCode)))
         }
         override fun onContactsChanged() { emit(BaleEvent.ContactsChanged) }
     }
 
-    private val handle: Long = BaleSignalingNative.nativeCreate(tokenStore, observer)
+    /** Opaque native handle. Exposed (rather than `internal`)
+     *  because [ai.bale.proxy.ClientTunnelManager] and
+     *  [ai.bale.proxy.ServerTunnelManager] live in a different
+     *  package and need it to construct their native peers. */
+    val handle: Long = BaleSignalingNative.nativeCreate(tokenStore, observer)
 
     /** Fire-and-forget into the SharedFlow. Drops the event if
      *  the buffer is somehow full (64 events is plenty for the
@@ -148,19 +125,11 @@ class BaleSignaling(
     suspend fun signOut(): Unit? = suspendCancellableCoroutine { cont ->
         BaleSignalingNative.nativeSignOut(handle, NativeContinuation(cont))
     }
-    /** App-foreground input to the Rust rule engine. WS goes
-     *  down in background (client mode) and back up in
-     *  foreground. Sync — no continuation. */
+    /** App lifecycle hint. The rule engine combines this with
+     *  the manager-driven `activate`/`deactivate` flag and the
+     *  user-intent flags to decide WS up/down. Default true. */
     fun setForeground(fg: Boolean) = BaleSignalingNative.nativeSetForeground(handle, fg)
 
-    /** LK call active input. Call `true` when an LkTunnel is
-     *  constructed, `false` when it's torn down. WS rule engine
-     *  pauses in client mode while active. */
-    fun setCallActive(active: Boolean) = BaleSignalingNative.nativeSetCallActive(handle, active)
-
-    /** Server foreground service running. Drives the rule
-     *  engine's server-vs-client semantics. */
-    fun setServerActive(active: Boolean) = BaleSignalingNative.nativeSetServerActive(handle, active)
     val isConnected:        Boolean get() = BaleSignalingNative.nativeIsConnected(handle)
     /** True while the run loop is actively trying to connect /
      *  reconnect — UI's "Connecting…" indicator. */
@@ -196,46 +165,10 @@ class BaleSignaling(
         BaleSignalingNative.nativeFetchDisplayName(handle, peerId, NativeContinuation(cont))
     }
 
-    // ── client side ───────────────────────────────────────────
-
-    suspend fun placeCall(peerId: String): PlaceCallResult {
-        val r: NativePlaceCallResult? = suspendCancellableCoroutine { cont ->
-            BaleSignalingNative.nativePlaceCall(handle, peerId, NativeContinuation(cont))
-        }
-        if (r == null) return PlaceCallResult.Transport
-        return when (r.errorCode) {
-            0 -> PlaceCallResult.Ok(
-                url    = r.url   .orEmpty(),
-                token  = r.token .orEmpty(),
-                peerId = r.peerId.orEmpty(),
-            )
-            1 -> PlaceCallResult.Rejected
-            2 -> PlaceCallResult.NoPeer
-            3 -> PlaceCallResult.NotAuthenticated
-            else -> PlaceCallResult.Transport
-        }
-    }
-
-    // ── server side ───────────────────────────────────────────
-
-    /** Install (or replace) the admission policy. The JNI side
-     *  invokes [BaleIncomingHandler.decide] on a worker thread;
-     *  it can suspend freely. */
-    fun setIncomingHandler(handler: BaleIncomingHandler) {
-        // Bridge suspend → sync — the JNI decide() is blocking
-        // on the Rust side via spawn_blocking, so a runBlocking
-        // here is safe (we're already on a worker thread).
-        val bridge = object : BaleSignalingNative.JavaIncomingHandler {
-            override fun decide(peerId: String, displayName: String?): Int = runBlocking {
-                when (handler.decide(peerId, displayName)) {
-                    CallDecision.Accept         -> 0
-                    CallDecision.Reject         -> 1
-                    CallDecision.SilentlyIgnore -> 2
-                }
-            }
-        }
-        BaleSignalingNative.nativeSetIncomingHandler(handle, bridge)
-    }
+    // Outgoing calls + admission both live on the tunnel
+    // managers now (ai.bale.proxy.ClientTunnelManager /
+    // ServerTunnelManager). BaleSignaling is just the Bale
+    // signaling protocol surface.
 
     // ── contacts ──────────────────────────────────────────────
 

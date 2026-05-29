@@ -323,7 +323,6 @@ dependencies = [
  "async-trait",
  "futures-util",
  "lk-signaling",
- "lktunnel",
  "log",
  "parking_lot",
  "rand 0.8.6",
@@ -2432,17 +2431,21 @@ name = "lk-signaling"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "once_cell",
+ "tokio",
 ]
 
 [[package]]
 name = "lktunnel"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures-util",
  "libc",
  "livekit-api",
  "livekit-protocol",
+ "lk-signaling",
  "log",
  "mio",
  "once_cell",

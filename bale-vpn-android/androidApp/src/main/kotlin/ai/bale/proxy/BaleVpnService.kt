@@ -1,8 +1,5 @@
 package ai.bale.proxy
 
-import ai.bale.proxy.bale.BaleEvent
-import ai.bale.proxy.bale.EndReason
-import ai.bale.proxy.bale.PlaceCallResult
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -16,6 +13,7 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.onSubscription
 
 private const val TAG = "BaleProxy"
 
@@ -28,11 +26,8 @@ class BaleVpnService : VpnService() {
     /** The LiveKit data-channel transport. Present once
      *  startVpn has begun setup. */
     private var transport: LkTunnel?            = null
-    /** Per-session subscriber on [BaleSignaling.events] for the
-     *  narrow CallEnded(Rejected) early-teardown path. Cancelled
-     *  in [stopVpn] so the next session's startVpn installs a
-     *  fresh collector against the correct `peerId`. */
-    private var eventsJob: Job?                  = null
+    /** Per-session subscriber on [ClientTunnelManager.events]. */
+    private var sessionsJob: Job?                = null
     private var wakeLock:  PowerManager.WakeLock? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     /** Independent scope for teardown work. Kept outside [scope]
@@ -268,57 +263,87 @@ class BaleVpnService : VpnService() {
             }
             Log.d(TAG, "VPN: WS ready")
 
-            val transport = LkTunnel()
-            this.transport = transport
-
-            // LK room-close hook — fires when the server peer
-            // leaves the room (LkTunnel detects the empty room
-            // and emits "disconnected"). Without this, the only
-            // teardown signal is Bale's CallEnded over the WS,
-            // which arrives 30s+ late (server-side push pipeline
-            // is slow / racy under cardinality-violation
-            // re-subscribes). The LK side knows immediately, so
-            // hook directly to flip the UI without waiting.
-            transport.onDisconnected = {
-                Log.d(TAG, "VPN: LkTunnel disconnected — server left room")
-                onPermanentDisconnect(rejected = false)
+            // Use the process-lived ClientTunnelManager from
+            // BaleConnection — it owns the foreground gate and
+            // the WS activate/deactivate decisions across the
+            // app's lifetime, not just for this session. Per-
+            // session VPN bring-up just calls placeCall and
+            // subscribes to events.
+            //
+            // No WS-CallEnded subscription here: the library's
+            // ClientTunnelManager applies the "LK is the sole
+            // authority once joined" rule centrally. Pre-LK
+            // CallEnded for our peer comes back as a
+            // `SessionEvent.Failed`; post-LK CallEnded is
+            // silently ignored. The Kotlin app only reacts to
+            // the manager's lifecycle events below.
+            val mgr = BaleConnection.clientMgr ?: run {
+                Log.e(TAG, "VPN: ClientTunnelManager not available (mode != client?)")
+                return
             }
-
-            // WS-event listener for any CallEnded targeting our
-            // peer. Server-side reject pushes CallEnded with
-            // discard_reason — we don't have a confirmed mapping
-            // to EndReason.Rejected yet (map_discard_reason in
-            // Rust returns Other(code) for everything), so we
-            // can't filter by reason. The peer-match guard alone
-            // is enough: a CallEnded for the specific peer we
-            // dialled is the server's authoritative "this call
-            // is over" signal. Reason is used only for UI
-            // labelling.
-            eventsJob = scope.launch {
-                sig.events.collect { ev ->
-                    if (ev is BaleEvent.CallEnded && ev.peerId == peerId) {
-                        val rejected = ev.reason == EndReason.Rejected
-                        Log.d(TAG, "VPN: WS callEnded for our peer (reason=${ev.reason}) — tearing down")
-                        onPermanentDisconnect(rejected = rejected)
+            val connected = kotlinx.coroutines.CompletableDeferred<Long>()
+            // Latch the subscription so placeCall can't race ahead
+            // of `collect` registering with the SharedFlow.
+            // `events` has replay=0; without this latch a Connected
+            // emitted between `launch` and the actual subscribe
+            // is dropped on the floor and `connected.await()` hangs.
+            val subscribed = kotlinx.coroutines.CompletableDeferred<Unit>()
+            val sessionsJob = scope.launch {
+                mgr.events
+                    .onSubscription {
+                        Log.i(TAG, "VPN: collector subscribed for peerId=$peerId")
+                        subscribed.complete(Unit)
                     }
-                }
+                    .collect { ev ->
+                        Log.i(TAG, "VPN: collector received $ev (waiting for peerId=$peerId)")
+                        when (ev) {
+                            is SessionEvent.Connected -> if (ev.peerId == peerId && !connected.isCompleted) {
+                                connected.complete(ev.tunnelHandle)
+                            }
+                            is SessionEvent.Disconnected -> if (ev.peerId == peerId) {
+                                Log.d(TAG, "VPN: manager reported Disconnected for $peerId")
+                                onPermanentDisconnect(rejected = false)
+                            }
+                            is SessionEvent.Failed -> if (ev.peerId == peerId) {
+                                Log.w(TAG, "VPN: manager reported Failed for $peerId — never connected")
+                                if (!connected.isCompleted)
+                                    connected.completeExceptionally(
+                                        IllegalStateException("LK never reached Connected"))
+                                onPermanentDisconnect(rejected = false)
+                            }
+                        }
+                    }
             }
+            subscribed.await()
 
             // Dial the call BEFORE touching TUN — if TUN comes up
             // first, apps route into a half-up VPN whose tunnel
-            // isn't ready yet and TCP SYNs time out.
-            val placed = sig.placeCall(peerId)
-            val (lkUrl, lkToken) = when (placed) {
-                is PlaceCallResult.Ok -> placed.url to placed.token
-                PlaceCallResult.Rejected -> {
+            // isn't ready yet and TCP SYNs time out. The manager's
+            // per-peer registry guarantees a re-call for the same
+            // peer disconnects the previous tunnel.
+            val placed = mgr.placeCall(peerId)
+            when (placed) {
+                PlaceCallResult.Ok                                 -> {}
+                PlaceCallResult.Rejected                           -> {
                     Log.w(TAG, "VPN: placeCall rejected"); onPermanentDisconnect(rejected = true); return
                 }
-                PlaceCallResult.NoPeer, PlaceCallResult.NotAuthenticated, PlaceCallResult.Transport -> {
+                PlaceCallResult.NoPeer,
+                PlaceCallResult.NotAuthenticated,
+                PlaceCallResult.Transport                          -> {
                     Log.w(TAG, "VPN: placeCall failed: $placed"); onPermanentDisconnect(rejected = false); return
                 }
             }
 
-            transport.connect(lkUrl, lkToken)
+            val tunnelHandle = try {
+                connected.await()
+            } catch (e: Exception) {
+                Log.w(TAG, "VPN: connect wait failed: ${e.message}")
+                return
+            }
+            val transport = LkTunnel(tunnelHandle)
+            this.transport = transport
+            this.sessionsJob = sessionsJob
+
             isConnected = true
 
             // ── VPN / SOCKS5 mode selection ─────────────────────────────
@@ -523,7 +548,12 @@ class BaleVpnService : VpnService() {
         // Room::close). The local tunFd is only non-null in the
         // window before detachFd transferred ownership.
         dialedPeerId = null
-        eventsJob?.cancel(); eventsJob = null
+        sessionsJob?.cancel(); sessionsJob = null
+        // The ClientTunnelManager is process-lived in
+        // BaleConnection; we only release the per-session tunnel
+        // here. `transport.disconnect()` is enough — the manager's
+        // watcher catches `EngineEvent::Disconnected`, clears
+        // its `current` slot, and emits SessionEvent.Disconnected.
         transport?.disconnect(); transport = null
         liveTransport = null
         tunFd?.close(); tunFd = null

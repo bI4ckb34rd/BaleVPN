@@ -1,11 +1,11 @@
-# Android-only workspace. The core `lktunnel` crate lives at the
-# repo top-level under `../../lktunnel-rust/lktunnel/` so it can be
-# shared with the CLI (and any future host-side consumers). Only the
-# JNI shim — which actually links to `libandroid.so` and ships as the
-# `liblktunnel.so` artefact loaded by Kotlin — lives here.
+# Android-only workspace. The core `lktunnel` + `bale-signaling`
+# crates live at the repo top-level so they can be shared with the
+# CLI / host binary. Only the merged JNI shim — which actually
+# links to `libandroid.so` and ships as the `liblktunnel_jni.so`
+# artefact loaded by Kotlin — lives here.
 [workspace]
 resolver = "2"
-members = ["lktunnel-android", "bale-signaling-android", "jni-shared"]
+members = ["lktunnel-jni", "jni-shared"]
 
 [workspace.package]
 edition = "2021"

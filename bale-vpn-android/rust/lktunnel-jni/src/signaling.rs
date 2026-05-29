@@ -1,19 +1,22 @@
-//! Android JNI shim for the `bale-signaling` crate. Bridges the
-//! async Rust API to sync Java entry points (the Kotlin side
-//! wraps each native call in a Kotlin coroutine if needed) and
-//! marshals `TokenStore` calls back to Java via a small
-//! Kotlin-defined interface.
+//! Signaling-side JNI surface (formerly `bale-signaling-android`).
 //!
-//! Naming convention:
-//!   * `ai.bale.proxy.bale.BaleAuthNative.*`        — static auth flow
-//!   * `ai.bale.proxy.bale.BaleSignalingNative.*`   — handle-based
-//!   * Kotlin `interface JavaTokenStore` is passed by reference
-//!     to `nativeCreate` and held via `GlobalRef`.
+//! Symbols:
+//!   * `Java_ai_bale_proxy_bale_BaleAuthNative_*`     — static auth flow
+//!   * `Java_ai_bale_proxy_bale_BaleSignalingNative_*` — handle-based
 //!
-//! The Java handle is a `jlong` pointing at a heap-allocated
-//! `Arc<BaleSignaling>`. Use [`with_signaling`] to borrow it.
+//! Bridges the async Rust API to sync Java entry points (the
+//! Kotlin side wraps each native call in a Kotlin coroutine if
+//! needed) and marshals `TokenStore` calls back to Java via a
+//! small Kotlin-defined interface.
+//!
+//! The Java handle is a `jlong` pointing into the [`REG`] handle
+//! registry of `Arc<BaleSignaling>`s. Use [`with_signaling`] to
+//! borrow it.
+//!
+//! `JNI_OnLoad` lives in the crate root (`lib.rs`); this module
+//! exposes [`init_class_refs`] which the unified loader calls to
+//! cache module-local class GlobalRefs.
 
-use std::ffi::c_void;
 use std::sync::Arc;
 
 use bale_signaling::auth::{AuthOutcome, BaleAuth};
@@ -21,75 +24,36 @@ use bale_signaling::BaleSignaling;
 use jni::objects::{GlobalRef, JClass, JMethodID, JObject, JString, JValue};
 use jni::signature::{Primitive, ReturnType};
 use jni::sys::{jboolean, jint, jlong, jobject, jstring, JNI_FALSE, JNI_TRUE};
-use jni::{JNIEnv, JavaVM};
+use jni::JNIEnv;
 use lk_signaling::{
-    CallDecision, EndReason, IncomingHandler, PeerId, PlaceCallError,
-    Signaling, TokenStore, TransportSession,
+    CallDecision, EndReason, IncomingHandler, PeerId,
+    Signaling, SignalingEvent, TokenStore, TunnelHooks,
 };
-// ─── Runtime + JavaVM ───────────────────────────────────────────────────
-//
-// Both `runtime()` and `vm()` live in [`jni_shared`] so the two
-// JNI shims (lktunnel-android + bale-signaling-android) share a
-// single tokio worker pool and a single JavaVM cache. Re-exports
-// keep the call sites in this file short.
+
+// Both `runtime()` and `vm()` live in [`jni_shared`] (process-wide
+// singletons used by the whole `.so`). Re-export shortens call sites.
 use jni_shared::{runtime, vm};
 
-// ─── JNI_OnLoad ────────────────────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn JNI_OnLoad(vm: JavaVM, _: *mut c_void) -> jni::sys::jint {
-    let _ = android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Debug)
-            .with_tag("BaleSig"),
-    );
-    log::info!("bale-signaling-android: JNI_OnLoad");
-
-    // Hand the JavaVM to jni_shared so the lktunnel shim shares
-    // the same cached pointer. Idempotent — whichever .so loads
-    // first wins; subsequent calls no-op.
-    jni_shared::set_vm(vm);
-
-    // Force runtime creation so the first auth RPC isn't delayed
-    // by tokio init.
-    let _ = runtime();
-
-    // Cache GlobalRefs to app-defined result classes. `find_class`
-    // from a tokio-attached background thread uses the system
-    // classloader and CANNOT see app classes — caching here
-    // (called from the Android linker's `System.loadLibrary`
-    // context, where the app classloader IS the loader) is the
-    // standard workaround. JVM-standard classes (String, Boolean,
-    // Long) live in the bootstrap classloader and stay
-    // accessible from any thread, so we don't cache those.
-    // `vm` here is `jni_shared::vm()` (the fn), not the moved
-    // `vm` parameter — explicit prefix avoids the name clash.
-    if let Ok(mut env) = jni_shared::vm().get_env() {
-        for (cell, name) in [
-            (&NATIVE_PLACE_CALL_RESULT_CLS, "ai/bale/proxy/bale/NativePlaceCallResult"),
-            (&NATIVE_CONTACT_PAGE_CLS,      "ai/bale/proxy/bale/NativeContactPage"),
-        ] {
-            match env.find_class(name) {
-                Ok(cls) => match env.new_global_ref(cls) {
-                    Ok(g)  => { let _ = cell.set(g); }
-                    Err(e) => log::warn!("JNI_OnLoad: GlobalRef for {name}: {e}"),
-                },
-                Err(e) => log::warn!("JNI_OnLoad: find_class {name}: {e}"),
-            }
-        }
-    }
-
-    jni::sys::JNI_VERSION_1_6
-}
-
-/// Cached `NativePlaceCallResult` class — looked up at
-/// `JNI_OnLoad` because background-thread `find_class` fails
-/// (wrong classloader). Used by [`marshal_place_call_result`].
-static NATIVE_PLACE_CALL_RESULT_CLS: once_cell::sync::OnceCell<jni::objects::GlobalRef>
-    = once_cell::sync::OnceCell::new();
-/// Same pattern for `NativeContactPage`.
+/// Cached `NativeContactPage` class.
 static NATIVE_CONTACT_PAGE_CLS: once_cell::sync::OnceCell<jni::objects::GlobalRef>
     = once_cell::sync::OnceCell::new();
+
+/// Called by the unified `JNI_OnLoad` to cache class GlobalRefs
+/// that this module needs. Must run from the `System.loadLibrary`
+/// thread (where the app classloader is current).
+pub(crate) fn init_class_refs(mut env: JNIEnv<'_>) {
+    for (cell, name) in [
+        (&NATIVE_CONTACT_PAGE_CLS,      "ai/bale/proxy/bale/NativeContactPage"),
+    ] {
+        match env.find_class(name) {
+            Ok(cls) => match env.new_global_ref(cls) {
+                Ok(g)  => { let _ = cell.set(g); }
+                Err(e) => log::warn!("JNI_OnLoad: GlobalRef for {name}: {e}"),
+            },
+            Err(e) => log::warn!("JNI_OnLoad: find_class {name}: {e}"),
+        }
+    }
+}
 
 // ─── Handle registry ─────────────────────────────────────────────────────
 //
@@ -107,7 +71,7 @@ static NATIVE_CONTACT_PAGE_CLS: once_cell::sync::OnceCell<jni::objects::GlobalRe
 /// `Arc<BaleSignaling>`. Shares the [`jni_shared::HandleRegistry`]
 /// pattern with the lktunnel shim; see that crate's docs for the
 /// per-call Arc-clone + atomic remove_and_take semantics.
-static REG: jni_shared::RegistryHandle<BaleSignaling> =
+pub(crate) static REG: jni_shared::RegistryHandle<BaleSignaling> =
     jni_shared::once_cell::sync::Lazy::new(jni_shared::HandleRegistry::new);
 
 fn box_signaling(s: Arc<BaleSignaling>) -> jlong {
@@ -187,30 +151,25 @@ impl TokenStore for JavaTokenStore {
     }
 }
 
-// ─── SignalingObserver bridge ───────────────────────────────────────────
+// ─── SignalingEvent listener bridge ──────────────────────────────────────
 
-/// Bridges every trait callback to the Kotlin
-/// `SignalingObserver` interface. Method IDs are cached at
-/// construction so each fire is one JNI call (no per-event
-/// lookup). Held by `Arc` so the trait callbacks (which need
-/// `'static`) can carry it.
-///
-/// Java interface (Kotlin side):
+/// Bridges the unified [`SignalingEvent`] stream into the
+/// Kotlin `SignalingEventListener` interface:
 ///
 /// ```kotlin
-/// interface SignalingObserver {
+/// interface SignalingEventListener {
 ///     fun onAuthExpired()
 ///     fun onProtocolObsolete()
-///     fun onSessionReady (peerId: String, url: String, token: String)
 ///     fun onCallEnded    (peerId: String, endReasonCode: Int)
 ///     fun onContactsChanged()
 /// }
 /// ```
+///
+/// Method IDs are cached at attach so each fire is one JNI call.
 struct JavaSignalingObserver {
     obs:                  GlobalRef,
     on_auth_expired:      JMethodID,
     on_protocol_obsolete: JMethodID,
-    on_session_ready:     JMethodID,
     on_call_ended:        JMethodID,
     on_contacts_changed:  JMethodID,
 }
@@ -220,50 +179,21 @@ impl JavaSignalingObserver {
         let cls = env.get_object_class(&observer)?;
         let on_auth_expired      = env.get_method_id(&cls, "onAuthExpired",     "()V")?;
         let on_protocol_obsolete = env.get_method_id(&cls, "onProtocolObsolete","()V")?;
-        let on_session_ready     = env.get_method_id(&cls, "onSessionReady",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V")?;
         let on_call_ended        = env.get_method_id(&cls, "onCallEnded",
             "(Ljava/lang/String;I)V")?;
         let on_contacts_changed  = env.get_method_id(&cls, "onContactsChanged", "()V")?;
         Ok(Self {
             obs: env.new_global_ref(observer)?,
-            on_auth_expired, on_protocol_obsolete, on_session_ready,
+            on_auth_expired, on_protocol_obsolete,
             on_call_ended, on_contacts_changed,
         })
     }
 
     fn fire_void(&self, mid: JMethodID) {
-        if let Ok(mut env) = vm().attach_current_thread_permanently() {
-            // SAFETY: the cached method id matches the cached
-            // method's signature ("()V"). Calling with an empty
-            // args slice is sound.
-            unsafe {
-                let _ = env.call_method_unchecked(
-                    self.obs.as_obj(), mid, ReturnType::Primitive(Primitive::Void), &[],
-                );
-            }
-        }
-    }
-
-    fn fire_string(&self, mid: JMethodID, sig_arity: usize, args: &[String]) {
         let Ok(mut env) = vm().attach_current_thread_permanently() else { return; };
-        // Cap at 3 because the only "string-only" signatures we
-        // use are 1- and 3-arg.
-        debug_assert!(sig_arity <= 3 && sig_arity == args.len());
-        let mut jvals = Vec::with_capacity(args.len());
-        let mut backing = Vec::with_capacity(args.len());
-        for s in args {
-            match env.new_string(s) {
-                Ok(j)  => backing.push(j),
-                Err(_) => return,
-            }
-        }
-        for j in &backing {
-            jvals.push(JValue::Object(j).as_jni());
-        }
         unsafe {
             let _ = env.call_method_unchecked(
-                self.obs.as_obj(), mid, ReturnType::Primitive(Primitive::Void), &jvals,
+                self.obs.as_obj(), mid, ReturnType::Primitive(Primitive::Void), &[],
             );
         }
     }
@@ -277,6 +207,17 @@ impl JavaSignalingObserver {
                 self.obs.as_obj(), self.on_call_ended,
                 ReturnType::Primitive(Primitive::Void), &jvals,
             );
+        }
+    }
+
+    fn dispatch(&self, ev: SignalingEvent) {
+        match ev {
+            SignalingEvent::AuthExpired      => self.fire_void(self.on_auth_expired),
+            SignalingEvent::ProtocolObsolete => self.fire_void(self.on_protocol_obsolete),
+            SignalingEvent::ContactsChanged  => self.fire_void(self.on_contacts_changed),
+            SignalingEvent::CallEnded { peer_id, reason } => {
+                self.fire_call_ended(peer_id.id_str(), end_reason_code(&reason));
+            }
         }
     }
 }
@@ -372,24 +313,13 @@ pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeCreate<
     };
     let sig = BaleSignaling::new(store);
 
-    // Wire every trait callback through the observer. Each
-    // closure owns a clone of the Arc so the observer survives
-    // until the BaleSignaling is dropped.
+    // Subscribe to the unified events stream once at construction
+    // and forward each one to the Kotlin observer interface.
+    let mut events = sig.events();
     let o = obs.clone();
-    sig.on_auth_expired(Box::new(move || o.fire_void(o.on_auth_expired)));
-    let o = obs.clone();
-    sig.on_protocol_obsolete(Box::new(move || o.fire_void(o.on_protocol_obsolete)));
-    let o = obs.clone();
-    sig.on_session_ready(Box::new(move |(peer, sess)| {
-        o.fire_string(o.on_session_ready, 3,
-            &[peer.id_str().to_string(), sess.url, sess.token]);
-    }));
-    let o = obs.clone();
-    sig.on_call_ended(Box::new(move |(peer, reason)| {
-        o.fire_call_ended(peer.id_str(), end_reason_code(&reason));
-    }));
-    let o = obs.clone();
-    sig.on_contacts_changed(Box::new(move || o.fire_void(o.on_contacts_changed)));
+    jni_shared::runtime().spawn(async move {
+        while let Some(ev) = events.recv().await { o.dispatch(ev); }
+    });
 
     box_signaling(sig)
 }
@@ -402,6 +332,10 @@ pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeDestroy
     // is in flight against this handle. See `with_signaling`.
     unsafe { drop_signaling(handle); }
 }
+
+// `nativeSubscribeSessions` removed — accepted incoming sessions
+// flow through `lktunnel::manager::ServerTunnelManager` now, whose
+// JNI lives in `manager.rs` (`nativeServerSubscribe`).
 
 /// Helper: stash the NativeContinuation in a GlobalRef. `None`
 /// on failure (logged); callers return early.
@@ -493,37 +427,19 @@ pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeIsAttem
 //   * `user_disconnect` — `connect()` / `disconnect()` already
 //     on the trait flip this in the right direction.
 
+// `nativeSetCallActive` / `nativeSetServerActive` removed —
+// computed by the lktunnel managers and pushed via
+// activate/deactivate on the Signaling trait. Foreground is
+// still pushed by the app's ProcessLifecycleOwner observer; the
+// rule engine combines it with manager_active.
+
 #[no_mangle]
 pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeSetForeground<'l>(
     _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong, fg: jboolean,
 ) {
-    // Setters are sync but the WsClient rule engine calls
-    // `tokio::spawn` inside `evaluate()` — that requires being
-    // in a runtime context. Kotlin lifecycle callbacks fire on
-    // threads without one, so enter the shared runtime first.
+    use lk_signaling::Signaling;
     let _g = runtime().enter();
     let _ = with_signaling(handle, |s| s.set_foreground(fg != JNI_FALSE));
-}
-
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeSetCallActive<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong, active: jboolean,
-) {
-    let _g = runtime().enter();
-    let _ = with_signaling(handle, |s| s.set_call_active(active != JNI_FALSE));
-}
-
-/// Server foreground service running. Push `true` from
-/// `BaleServerService.onStartCommand`, `false` from `stopServer`.
-/// The rule engine applies server semantics (WS always on) when
-/// `true`, client semantics (gates on foreground + !call_active)
-/// when `false`.
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeSetServerActive<'l>(
-    _env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong, active: jboolean,
-) {
-    let _g = runtime().enter();
-    let _ = with_signaling(handle, |s| s.set_server_active(active != JNI_FALSE));
 }
 
 #[no_mangle]
@@ -580,87 +496,10 @@ pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeResolve
         jni_shared::marshal_string_opt);
 }
 
-/// Place a call. Returns an `ai.bale.proxy.bale.NativePlaceCallResult`
-/// — a small Kotlin data class with fields:
-///   * `errorCode` (int) — 0 = ok, 1 = rejected, 2 = no peer, 3 = unauth, 4 = transport
-///   * `url`       (string?)
-///   * `token`     (string?)
-///   * `peerId`    (string?)
-///
-/// We can't return a tagged union directly, so the error case
-/// surfaces through `errorCode != 0` and null payload fields.
-#[no_mangle]
-pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativePlaceCall<'l>(
-    mut env: JNIEnv<'l>, _cls: JClass<'l>, handle: jlong, peer_id: JString<'l>, cont: JObject<'l>,
-) {
-    let Some(cont) = cont_ref(&mut env, cont, "nativePlaceCall") else { return };
-    let peer_str = jstr(&mut env, &peer_id);
-    let Some(arc) = REG.lookup(handle as u64) else {
-        jni_shared::spawn_with_continuation(cont,
-            async { Ok::<_, String>(Err::<TransportSession, PlaceCallError>(
-                PlaceCallError::Transport("invalid handle".into()))) },
-            marshal_place_call_result);
-        return;
-    };
-    jni_shared::spawn_with_continuation(
-        cont,
-        async move {
-            let outcome = match arc.resolve_peer(&peer_str).await {
-                Some(peer) => arc.place_call(peer).await,
-                None       => Err(PlaceCallError::NoPeer),
-            };
-            Ok::<_, String>(outcome)
-        },
-        marshal_place_call_result,
-    );
-}
-
-/// Marshal a `Result<TransportSession, PlaceCallError>` into a
-/// `NativePlaceCallResult` instance. Errors become non-zero
-/// `errorCode` with null payload fields; the Kotlin
-/// [PlaceCallResult] mapping translates the code.
-fn marshal_place_call_result(
-    env: &mut JNIEnv,
-    outcome: Result<TransportSession, PlaceCallError>,
-) -> jobject {
-    let Some(cls_ref) = NATIVE_PLACE_CALL_RESULT_CLS.get() else {
-        log::warn!("nativePlaceCall marshal: NativePlaceCallResult class not cached");
-        return std::ptr::null_mut();
-    };
-    let cls = <&JClass>::from(cls_ref.as_obj());
-    let (error_code, url, token, peer_id) = match outcome {
-        Ok(s)  => (0i32, Some(s.url), Some(s.token), Some(s.peer_id.id_str().to_string())),
-        Err(e) => {
-            // Surface the underlying error — the JNI returns a
-            // coarse error code, which loses the message.
-            log::warn!("place_call: {e:?}");
-            let code = match e {
-                PlaceCallError::Rejected         => 1,
-                PlaceCallError::NoPeer           => 2,
-                PlaceCallError::NotAuthenticated => 3,
-                PlaceCallError::Transport(_)    => 4,
-            };
-            (code, None, None, None)
-        }
-    };
-    let url_j   = url   .and_then(|s| env.new_string(&s).ok());
-    let token_j = token .and_then(|s| env.new_string(&s).ok());
-    let peer_j  = peer_id.and_then(|s| env.new_string(&s).ok());
-    let null_obj = JObject::null();
-    let url_ref   = url_j  .as_ref().map(AsRef::as_ref).unwrap_or(&null_obj);
-    let token_ref = token_j.as_ref().map(AsRef::as_ref).unwrap_or(&null_obj);
-    let peer_ref  = peer_j .as_ref().map(AsRef::as_ref).unwrap_or(&null_obj);
-    let args = [
-        JValue::Int(error_code),
-        JValue::Object(url_ref),
-        JValue::Object(token_ref),
-        JValue::Object(peer_ref),
-    ];
-    env.new_object(cls,
-        "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-        &args,
-    ).map(|o| o.into_raw()).unwrap_or(std::ptr::null_mut())
-}
+// `nativePlaceCall` removed — outgoing calls go through
+// `LkManagerNative.nativePlaceCall` on a `ClientTunnelManager`.
+// `BaleSignalingNative` now only exposes auth / contacts /
+// connect / disconnect.
 
 /// Install (or clear) the incoming-call handler. `null` argument
 /// removes any existing handler.
@@ -685,7 +524,7 @@ pub extern "system" fn Java_ai_bale_proxy_bale_BaleSignalingNative_nativeSetInco
     let _g = runtime().enter();
     with_signaling(handle, |sig| {
         if let Some(h) = installed {
-            sig.set_incoming_handler(h);
+            sig.tunnel_hooks().set_incoming_handler(h);
         }
         // No clear() API on the trait yet — leaving the previous
         // handler in place when the argument is null. Future: add

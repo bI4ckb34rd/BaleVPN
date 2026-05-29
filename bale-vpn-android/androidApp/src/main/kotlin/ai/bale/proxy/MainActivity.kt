@@ -125,12 +125,12 @@ class MainActivity : BaseActivity() {
         btnManageClients   = findViewById(R.id.btnManageAdmission)
         btnLogout     = findViewById(R.id.btnLogout)
 
-        applyMode(prefs.getString("mode", "client") ?: "client")
+        applyMode(Mode.fromStorage(prefs.getString("mode", null)))
 
         toggleMode.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked || updatingToggle) return@addOnButtonCheckedListener
-            val mode = if (checkedId == R.id.btnModeClient) "client" else "server"
-            prefs.edit().putString("mode", mode).apply()
+            val mode = if (checkedId == R.id.btnModeClient) Mode.CLIENT else Mode.SERVER
+            prefs.edit().putString("mode", mode.storageKey()).apply()
             switchToMode(mode)
         }
 
@@ -230,6 +230,21 @@ class MainActivity : BaseActivity() {
                 return@setOnCheckedChangeListener
             }
             if (isChecked) {
+                // If the VPN is dialing but LK isn't up yet,
+                // there's no live transport to bind a listener
+                // against. Don't try the native call — it would
+                // return 0 (failure) and trip the auto-revert
+                // path, leaving prefs=true / toggle=false out of
+                // sync forever. Persist the intent + show
+                // "Pending…"; `BaleVpnService.startVpn` reads
+                // the same pref once LK lands and auto-enables.
+                // The UI tick picks the bound port up from the
+                // native side a moment later.
+                if (!BaleVpnService.isConnected) {
+                    tvSocks5Status.visibility = View.VISIBLE
+                    tvSocks5Status.text = "Pending — waiting for tunnel…"
+                    return@setOnCheckedChangeListener
+                }
                 tvSocks5Status.visibility = View.VISIBLE
                 tvSocks5Status.text = "Starting…"
                 uiScope.launch {
@@ -241,6 +256,10 @@ class MainActivity : BaseActivity() {
                         socks5UpdatingProgrammatically = true
                         try { swSocks5.isChecked = false }
                         finally { socks5UpdatingProgrammatically = false }
+                        // Revert prefs too, otherwise the next
+                        // startVpn auto-enable resurrects the
+                        // dead toggle state.
+                        prefs.edit().putBoolean("socks5_enabled", false).apply()
                     } else {
                         renderSocks5Listening(bound)
                     }
@@ -279,25 +298,25 @@ class MainActivity : BaseActivity() {
         requestBackgroundPermissions()
     }
 
-    private fun applyMode(mode: String) {
+    private fun applyMode(mode: Mode) {
         updatingToggle = true
-        toggleMode.check(if (mode == "server") R.id.btnModeServer else R.id.btnModeClient)
+        toggleMode.check(if (mode == Mode.SERVER) R.id.btnModeServer else R.id.btnModeClient)
         updatingToggle = false
         showModeLayout(mode)
     }
 
-    private fun switchToMode(mode: String) {
-        if (mode == "server") {
+    private fun switchToMode(mode: Mode) {
+        if (mode == Mode.SERVER) {
             if (BaleVpnService.isRunning) stopVpn()
             ensureServerRunning()
         } else {
             if (BaleServerService.isRunning) stopServer()
         }
-        // Mode switching no longer pushes anything directly to
-        // the WS rule engine — the engine derives semantics from
-        // `server_active`, which BaleServerService.onStartCommand /
-        // stopServer push themselves. Here we only ensure the WS
-        // intent is on (sig.connect is idempotent).
+        // Swap the active tunnel manager up-front. The service
+        // start/stop paths set the mode too, but doing it here
+        // guarantees the WS gating reconciles immediately even
+        // before the service is fully up/down.
+        BaleConnection.setMode(mode)
         BaleConnection.signaling?.let { sig ->
             uiScope.launch { sig.connect() }
         }
@@ -345,11 +364,12 @@ class MainActivity : BaseActivity() {
         if (tvSocks5Status.text != newText) tvSocks5Status.text = newText
     }
 
-    private fun showModeLayout(mode: String) {
-        layoutClient.visibility = if (mode == "server") View.GONE else View.VISIBLE
-        layoutServer.visibility = if (mode == "server") View.VISIBLE else View.GONE
+    private fun showModeLayout(mode: Mode) {
+        val server = mode == Mode.SERVER
+        layoutClient.visibility = if (server) View.GONE else View.VISIBLE
+        layoutServer.visibility = if (server) View.VISIBLE else View.GONE
         // SOCKS5 toggle is only meaningful in client mode.
-        layoutSocks5.visibility = if (mode == "server") View.GONE else View.VISIBLE
+        layoutSocks5.visibility = if (server) View.GONE else View.VISIBLE
     }
 
     private fun requestBackgroundPermissions() {
@@ -371,7 +391,7 @@ class MainActivity : BaseActivity() {
 
     override fun onResume() {
         super.onResume()
-        val mode = prefs.getString("mode", "client") ?: "client"
+        val mode = Mode.fromStorage(prefs.getString("mode", null))
         applyMode(mode)
 
         // WS lifecycle is driven by BaleApp's ProcessLifecycleOwner observer
@@ -380,7 +400,7 @@ class MainActivity : BaseActivity() {
 
         // Server mode is "always on" while selected — auto-start if it's not running yet
         // (e.g., after a reboot, after the OS killed the service, or first launch).
-        if (mode == "server") ensureServerRunning()
+        if (mode == Mode.SERVER) ensureServerRunning()
 
         pollJob?.cancel()
         pollJob = uiScope.launch {
@@ -411,7 +431,7 @@ class MainActivity : BaseActivity() {
             Toast.makeText(this, "App is out of date — please update", Toast.LENGTH_LONG).show()
         }
 
-        val mode           = prefs.getString("mode", "client") ?: "client"
+        val mode           = Mode.fromStorage(prefs.getString("mode", null))
         val wsReady        = BaleConnection.isReady
         val serviceRunning = BaleVpnService.isRunning || BaleServerService.isRunning
 
@@ -450,7 +470,7 @@ class MainActivity : BaseActivity() {
         // legitimately want to force-tear-down (which also disconnects all clients).
         // In client mode the WS comes and goes automatically with the app lifecycle and
         // VPN reconnects, so a manual button would just be a footgun.
-        if (mode == "server") {
+        if (mode == Mode.SERVER) {
             btnWs.visibility = View.VISIBLE
             btnWs.text       = if (BaleConnection.isConnectRequested || BaleConnection.isReady) "Disconnect" else "Connect"
         } else {
@@ -467,7 +487,7 @@ class MainActivity : BaseActivity() {
         btnModeClient.isEnabled = !lockToggle
         btnModeServer.isEnabled = !lockToggle
 
-        if (mode == "client") {
+        if (mode == Mode.CLIENT) {
             tickClient(wsReady)
         } else tickServer(wsReady)
 

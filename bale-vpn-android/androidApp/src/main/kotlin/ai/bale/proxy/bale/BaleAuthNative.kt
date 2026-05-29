@@ -25,7 +25,7 @@ import ai.bale.proxy.NativeContinuation
  */
 internal object BaleAuthNative {
 
-    init { System.loadLibrary("bale_signaling") }
+    init { System.loadLibrary("lktunnel_jni") }    // merged shim
 
     @JvmStatic external fun nativeStartPhoneAuth  (phone: String, cont: NativeContinuation<String?>)
     @JvmStatic external fun nativeSubmitOtp       (tx: String, code: String, cont: NativeContinuation<String?>)

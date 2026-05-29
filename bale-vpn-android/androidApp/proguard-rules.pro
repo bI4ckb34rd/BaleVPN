@@ -1,9 +1,4 @@
 # R8 / ProGuard keep rules for the release build.
-#
-# The transport is webrtc-rs (pure Rust) — there's no libwebrtc Java
-# sidecar AAR anymore, so the old `-keep class livekit.org.**` rules
-# (which protected the webrtc-sdk's `FindClass("livekit/org/...")`
-# lookups) are gone.
 
 # Anything with a native method — keep both the class and the
 # native method signatures so JNI symbol resolution still works.
@@ -11,25 +6,30 @@
     native <methods>;
 }
 
-# Our own JNI surfaces (Rust side calls back into these via JNI).
--keep class ai.bale.proxy.LkNative { *; }
--keep class ai.bale.proxy.NativeJni { *; }
--keep class ai.bale.proxy.LkTunnel { *; }
--keep class ai.bale.proxy.LkTunnel$* { *; }
+# Application class — referenced by name from AndroidManifest as
+# `android:name=".BaleApp"`. R8 should auto-keep on manifest match
+# but it's been observed to strip it; pin explicitly.
+-keep class ai.bale.proxy.BaleApp { *; }
 
-# The async-JNI continuation bridge (jni-shared `spawn_with_continuation`).
+# Native JNI surfaces (Rust calls back into these by name).
+-keep class ai.bale.proxy.LkNative              { *; }
+-keep class ai.bale.proxy.NativeJni             { *; }
+-keep class ai.bale.proxy.LkTunnel              { *; }
+-keep class ai.bale.proxy.LkTunnel$*            { *; }
+-keep class ai.bale.proxy.LkTunnelNative        { *; }
+-keep class ai.bale.proxy.LkManagerNative       { *; }
+-keep class ai.bale.proxy.LkManagerNative$*     { *; }
+
+# Session listener / admission decider interfaces — Rust looks up
+# their method IDs by name (`onConnected`, `onDisconnected`,
+# `decide`); R8 would otherwise rename them.
+-keep interface ai.bale.proxy.LkManagerNative$SessionListener     { *; }
+-keep interface ai.bale.proxy.LkManagerNative$AdmissionDecider    { *; }
+
+# Async-JNI continuation bridge (jni-shared `spawn_with_continuation`).
 # Rust resolves `onSuccess(Object)` / `onError(String)` BY NAME on the
-# passed-in instance — no Java caller references them, so without this R8
-# renames them and the native call fails at runtime with
-# `NoSuchMethodError: ...NativeContinuation.onSuccess(Ljava/lang/Object;)V`.
+# passed-in instance.
 -keep class ai.bale.proxy.NativeContinuation { *; }
 
-# JNI result/marshaling classes the bale-signaling Rust shim looks up
-# via `env.find_class(...)` in JNI_OnLoad (bale-signaling-android
-# libjni.rs) and then constructs / populates by field — e.g.
-# NativePlaceCallResult, NativeContactPage. R8 can't see native
-# FindClass, so without this it strips/renames the whole package and
-# the app aborts at load with
-# `ClassNotFoundException: ai.bale.proxy.bale.NativePlaceCallResult`.
-# Keep the class names AND members (ctors/fields) the native side uses.
+# BaleSignaling JNI surface — Rust looks classes up via env.find_class.
 -keep class ai.bale.proxy.bale.** { *; }

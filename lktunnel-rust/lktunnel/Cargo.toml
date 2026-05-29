@@ -19,6 +19,10 @@ description = "LiveKit-backed tunnel client: session-keyed connect/send/recv ove
 crate-type = ["lib"]
 
 [dependencies]
+# Signaling-trait surface for the `manager` module. Pure abstraction
+# (PeerId / TransportSession / Signaling / IncomingHandler) — no
+# transport coupling.
+lk-signaling = { path = "../../lk-signaling-rust/lk-signaling" }
 # Pure-Rust WebRTC stack (ICE/DTLS/SRTP/RTP) — replaces libwebrtc. No
 # C++, no NDK, no webrtc-sys. Drives the carrier media tracks in `rtc.rs`.
 webrtc      = "0.11"
@@ -30,6 +34,8 @@ webrtc      = "0.11"
 # cacerts as DER and need Android's TrustManager).
 livekit-api      = { version = "0.4", features = ["signal-client-tokio", "rustls-tls-webpki-roots"] }
 livekit-protocol = "0.7.7"
+# Async fns in `IncomingDecider` (manager's admission trait).
+async-trait = "0.1"
 # Trickle ICE candidates cross the wire as JSON (RTCIceCandidateInit).
 serde_json  = "1"
 tokio       = { version = "1",   features = ["rt-multi-thread", "sync", "macros"] }

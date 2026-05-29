@@ -552,32 +552,29 @@ pub struct WsClient {
     // ── Rule-engine inputs ────────────────────────────────────
     //
     // The rule:
-    //   want = token.is_some()
-    //       && !user_disconnect
-    //       && ( server_active                       // server: always-on
-    //            || (foreground && !call_active) )   // client: app + no call
+    //   want = token.is_some() && !user_disconnect && manager_active
     //
-    // No explicit "mode" — server_active alone distinguishes the
-    // two semantics. Set by `BaleServerService.onStartCommand` →
-    // true; cleared by `BaleServerService.stopServer` → false.
+    // Foreground/background lifecycle is owned by the lktunnel
+    // manager (it subscribes to `subscribe_foreground` and folds
+    // foreground into its `activate`/`deactivate` decision); the
+    // rule engine itself only sees the manager's single
+    // `manager_active` flag.
 
-    /// App in foreground? Client semantics only (ignored when
-    /// `server_active`). Defaults to `true` so headless callers
-    /// (Rust binary) don't have to set it explicitly.
-    foreground:        AtomicBool,
-    /// A client LK call is active. When `true` the WS pauses
-    /// (client semantics only — server ignores this) — Bale's
-    /// push channel isn't needed mid-call and would waste
-    /// battery / bandwidth.
-    call_active:       AtomicBool,
     /// User explicitly pressed "Disconnect". Sticky until cleared.
-    /// Wins in both semantics.
-    user_disconnect:   AtomicBool,
-    /// Server foreground service is running and wants to accept
-    /// incoming calls. When `true`, the WS stays up regardless of
-    /// `foreground` / `call_active` (server can't receive
-    /// `callReceived` pushes if the WS is paused).
-    server_active:     AtomicBool,
+    user_disconnect: AtomicBool,
+    /// Transport-side manager's "I want the WS up" flag — see
+    /// [`Self::set_manager_active`]. Defaults to `true` so
+    /// callers without a manager get the WS up unconditionally.
+    /// A long-lived [`crate::manager::ActivationDriver`] in
+    /// lktunnel owns the lifecycle of this flag — managers are
+    /// per-mode and short-lived, so they push intent through
+    /// the driver rather than touching this directly.
+    manager_active:  AtomicBool,
+    /// App-lifecycle hint pushed via [`Self::set_foreground`] and
+    /// surfaced to managers via [`Self::subscribe_foreground`].
+    /// Owned as a watch channel so the managers' reconcile loops
+    /// fire on transitions without polling.
+    foreground:      tokio::sync::watch::Sender<bool>,
 
     // ── RPC plumbing ──────────────────────────────────────────
     rpc_idx:           AtomicI32,
@@ -629,10 +626,9 @@ impl WsClient {
         Arc::new(Self {
             ready:            AtomicBool::new(false),
             running:          AtomicBool::new(false),
-            foreground:       AtomicBool::new(true),
-            call_active:      AtomicBool::new(false),
-            user_disconnect:  AtomicBool::new(false),
-            server_active:    AtomicBool::new(false),
+            user_disconnect: AtomicBool::new(false),
+            manager_active:  AtomicBool::new(true),
+            foreground:      tokio::sync::watch::channel(true).0,
             rpc_idx:          AtomicI32::new(1),
             pending:          Mutex::new(HashMap::new()),
             send_tx:          Mutex::new(None),
@@ -821,18 +817,12 @@ impl WsClient {
 
     // ── Rule-engine setters ───────────────────────────────────
     //
-    // These are the *only* knobs that drive the WS lifecycle.
-    // Setting any one of them re-evaluates the rule and spawns
-    // or aborts the run loop as needed. Apps push inputs; the
-    // library owns the decision.
+    // The WS lifecycle has just three inputs now:
+    //   - token        (set/cleared by sign-in/sign-out)
+    //   - user_disconnect (sticky from user's Disconnect button)
+    //   - manager_active  (pushed by the lktunnel manager)
     //
-    // Rule (see `desired_up`):
-    //   want = token.is_some()
-    //       && !user_disconnect
-    //       && match mode {
-    //              Server => true,
-    //              Client => foreground && !call_active,
-    //          }
+    // Rule: want = token.is_some() && !user_disconnect && manager_active
 
     /// Set or clear the access token. `None` = signed out; the
     /// rule will tear the WS down regardless of other inputs.
@@ -850,42 +840,33 @@ impl WsClient {
         if changed { self.evaluate(); }
     }
 
-    /// App in foreground. Client-mode only — Server ignores.
-    pub fn set_foreground(self: &Arc<Self>, fg: bool) {
-        if self.foreground.swap(fg, Ordering::Relaxed) != fg { self.evaluate(); }
-    }
-
-    /// LK call active. When `true`, the WS goes down in client
-    /// mode (push channel unneeded mid-call). Set by the LK
-    /// transport's lifecycle hook, not by app code.
-    pub fn set_call_active(self: &Arc<Self>, active: bool) {
-        if self.call_active.swap(active, Ordering::Relaxed) != active { self.evaluate(); }
-    }
-
     /// User explicitly pressed "Disconnect" (or cleared it).
-    /// Sticky in both modes — wins over `foreground`/`call_active`.
+    /// Sticky — wins over `manager_active`.
     pub fn set_user_disconnect(self: &Arc<Self>, disc: bool) {
         if self.user_disconnect.swap(disc, Ordering::Relaxed) != disc { self.evaluate(); }
     }
 
-    /// Server foreground service running. When `true` the WS
-    /// stays up regardless of foreground / call_active (server
-    /// semantics: always-on modulo user_disconnect + token).
-    /// When `false` the rule falls back to client semantics
-    /// (gates on foreground + !call_active).
-    ///
-    /// A transition also clears `call_active`: the flag is
-    /// scoped to the current "session" and a server↔client flip
-    /// invalidates whatever the previous side was tracking.
-    /// Without this, server-role LkTunnels that set
-    /// `call_active=true` (harmless under server semantics)
-    /// would leak into a subsequent client session and tear the
-    /// WS down until async LK teardown clears it.
-    pub fn set_server_active(self: &Arc<Self>, active: bool) {
-        if self.server_active.swap(active, Ordering::Relaxed) != active {
-            self.call_active.store(false, Ordering::Relaxed);
-            self.evaluate();
-        }
+    /// Push from the lktunnel `ActivationDriver`: "I want the
+    /// WS up right now." Combined with `token` and
+    /// `user_disconnect` to produce the actual up/down decision.
+    pub fn set_manager_active(self: &Arc<Self>, active: bool) {
+        if self.manager_active.swap(active, Ordering::Relaxed) != active { self.evaluate(); }
+    }
+
+    /// App lifecycle hint. Pushed by the app
+    /// (ProcessLifecycleOwner etc.) and observed by the lktunnel
+    /// manager via [`Self::subscribe_foreground`]; the WS rule
+    /// engine itself doesn't gate on it directly.
+    pub fn set_foreground(&self, fg: bool) {
+        // send_if_modified collapses no-op pushes.
+        self.foreground.send_if_modified(|cur| {
+            if *cur == fg { false } else { *cur = fg; true }
+        });
+    }
+
+    /// Subscribe to foreground-state changes.
+    pub fn subscribe_foreground(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.foreground.subscribe()
     }
 
     pub(crate) fn has_token(&self) -> bool { self.access_token.lock().is_some() }
@@ -894,12 +875,9 @@ impl WsClient {
     /// Returns `true` when current inputs say the WS should be up.
     /// Crate-private — apps observe via `is_ready`.
     pub(crate) fn desired_up(&self) -> bool {
-        if !self.has_token() { return false; }
-        if self.user_disconnect.load(Ordering::Relaxed) { return false; }
-        if self.server_active.load(Ordering::Relaxed) { return true; }
-        // Client semantics: WS up iff foregrounded AND no LK call.
-        self.foreground.load(Ordering::Relaxed)
-            && !self.call_active.load(Ordering::Relaxed)
+        self.has_token()
+            && !self.user_disconnect.load(Ordering::Relaxed)
+            && self.manager_active.load(Ordering::Relaxed)
     }
 
     /// Re-evaluate the rule and reconcile the run loop. Called
@@ -946,11 +924,10 @@ impl WsClient {
             (false, true) => {
                 log::info!(
                     "WS: rule no longer satisfied — tearing connection down \
-                     (call_active={} foreground={} server_active={} user_disconnect={})",
-                    self.call_active.load(Ordering::Relaxed),
-                    self.foreground.load(Ordering::Relaxed),
-                    self.server_active.load(Ordering::Relaxed),
+                     (manager_active={} user_disconnect={} has_token={})",
+                    self.manager_active.load(Ordering::Relaxed),
                     self.user_disconnect.load(Ordering::Relaxed),
+                    self.has_token(),
                 );
                 self.running.store(false, Ordering::Relaxed);
                 self.ready.store(false, Ordering::Relaxed);
@@ -2503,58 +2480,30 @@ mod tests {
     // ── Rule-engine table ─────────────────────────────────────
     //
     // The rule:
-    //   want = token.is_some()
-    //       && !user_disconnect
-    //       && match mode {
-    //              Server => true,
-    //              Client => foreground && !call_active,
-    //          }
-    //
-    // We don't spawn the run loop in these tests (no tokio
-    // runtime). Just assert `desired_up()` directly — it's the
-    // pure function the engine evaluates.
+    //   want = token.is_some() && !user_disc && manager_active
 
-    fn ws_with(token: Option<&str>, fg: bool, call: bool, ud: bool, server_active: bool) -> std::sync::Arc<WsClient> {
+    fn ws_with(token: Option<&str>, ud: bool, mgr: bool) -> std::sync::Arc<WsClient> {
         let w = WsClient::new();
         if let Some(t) = token { *w.access_token.lock() = Some(t.to_string()); }
-        w.foreground.store(fg, Ordering::Relaxed);
-        w.call_active.store(call, Ordering::Relaxed);
         w.user_disconnect.store(ud, Ordering::Relaxed);
-        w.server_active.store(server_active, Ordering::Relaxed);
+        w.manager_active .store(mgr, Ordering::Relaxed);
         w
     }
 
     #[test]
     fn rule_requires_token() {
-        let w = ws_with(None, true, false, false, false);
-        assert!(!w.desired_up(), "no token → never up (client)");
-        let w = ws_with(None, true, false, false, true);
-        assert!(!w.desired_up(), "no token → never up (server too)");
+        assert!(!ws_with(None, false, true).desired_up());
     }
 
     #[test]
     fn rule_user_disconnect_wins() {
-        let w = ws_with(Some("t"), true, false, true, false);
-        assert!(!w.desired_up());
-        let w = ws_with(Some("t"), true, false, true, true);
-        assert!(!w.desired_up());
+        assert!(!ws_with(Some("t"), true, true).desired_up());
     }
 
     #[test]
-    fn rule_server_stays_up_modulo_token_and_disconnect() {
-        // server_active=true ignores foreground / call_active.
-        let w = ws_with(Some("t"), false, true, false, true);
-        assert!(w.desired_up());
-    }
-
-    #[test]
-    fn rule_client_needs_foreground_and_no_call() {
-        let w = ws_with(Some("t"), true, false, false, false);
-        assert!(w.desired_up(), "fg + no call → up");
-        let w = ws_with(Some("t"), false, false, false, false);
-        assert!(!w.desired_up(), "background → down");
-        let w = ws_with(Some("t"), true, true, false, false);
-        assert!(!w.desired_up(), "call active → down (key new rule)");
+    fn rule_manager_gates() {
+        assert!( ws_with(Some("t"), false, true ).desired_up());
+        assert!(!ws_with(Some("t"), false, false).desired_up());
     }
 
     #[test]

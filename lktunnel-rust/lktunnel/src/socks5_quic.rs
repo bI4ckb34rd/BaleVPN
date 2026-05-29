@@ -28,8 +28,10 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::AbortHandle;
@@ -150,13 +152,35 @@ impl From<crate::quic_tunnel::QuicEndpointError> for Socks5Error {
 /// `disable_socks5_server`. The QUIC client lives separately on
 /// `TunnelInner::quic_client` and persists across SOCKS5 toggles.
 pub(crate) struct Socks5Handle {
-    /// Aborts the SOCKS5 accept loop. Each per-connection task ends
-    /// naturally when the SOCKS5 client or the QUIC stream closes;
-    /// killing the accept loop just stops accepting new ones.
+    /// Aborts the SOCKS5 accept loop. New incoming TCP connects fail
+    /// after this fires; in-flight per-conn pump tasks are aborted
+    /// separately via [`Self::conn_aborts`].
     pub(crate) listener_abort: AbortHandle,
     /// Local socket the listener is bound to — useful for surfacing
     /// in logs / UI.
     pub(crate) local_addr: SocketAddr,
+    /// Per-connection pump task abort handles, populated by the
+    /// accept loop on every new connection. `disable_socks5_server`
+    /// walks this and aborts each so in-flight SOCKS5 streams die
+    /// immediately — without this, apps holding HTTP keepalive
+    /// sockets through the proxy would keep proxying after the
+    /// user flipped the toggle off. Pruned of finished entries on
+    /// every push so a long-lived listener doesn't accumulate
+    /// dead handles unbounded.
+    pub(crate) conn_aborts: Arc<Mutex<Vec<AbortHandle>>>,
+}
+
+impl Socks5Handle {
+    /// Abort every in-flight per-conn pump task and clear the slot.
+    /// Called from [`crate::LkTunnel::disable_socks5_server`] after
+    /// `listener_abort.abort()` so existing SOCKS5 connections drop
+    /// in lockstep with the listener.
+    pub(crate) fn abort_all_conns(&self) {
+        let mut g = self.conn_aborts.lock();
+        let n = g.len();
+        for a in g.drain(..) { a.abort(); }
+        if n > 0 { log::info!("socks5: aborted {n} in-flight connections"); }
+    }
 }
 
 /// Server-side handle: ties the QUIC stream-acceptor task lifetime
@@ -178,7 +202,7 @@ pub(crate) struct QuicServerHandle {
 /// streams die at the TCP level (their apps see a disconnect), new
 /// SOCKS5 client requests pick up the freshly-reconnected QUIC.
 pub(crate) async fn enable_listener(
-    tunnel: LkTunnel,
+    tunnel: Arc<LkTunnel>,
     port:   u16,
 ) -> Result<Socks5Handle, Socks5Error> {
     // Use TcpSocket so we can set SO_REUSEADDR before bind.
@@ -196,7 +220,9 @@ pub(crate) async fn enable_listener(
     let local_addr = listener.local_addr().map_err(Socks5Error::Bind)?;
     log::info!("socks5: listening on {local_addr}");
 
-    let weak_inner = std::sync::Arc::downgrade(&tunnel.inner);
+    let weak_inner = std::sync::Arc::downgrade(&tunnel);
+    let conn_aborts: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
+    let conn_aborts_for_loop = conn_aborts.clone();
     let task = crate::runtime().spawn(async move {
         loop {
             match listener.accept().await {
@@ -210,8 +236,8 @@ pub(crate) async fn enable_listener(
                     // finishes, or the keeper is mid-reconnect — wait briefly
                     // rather than refusing, so a client connecting right after
                     // enable doesn't get a spurious failure.
-                    let weak = weak_inner.clone();
-                    crate::runtime().spawn(async move {
+                    let weak  = weak_inner.clone();
+                    let join  = crate::runtime().spawn(async move {
                         let mut conn = None;
                         for _ in 0..100 {  // up to ~10s (100 × 100 ms)
                             let Some(inner) = weak.upgrade() else { return };
@@ -231,6 +257,13 @@ pub(crate) async fn enable_listener(
                             log::debug!("socks5: per-conn ended: {e}");
                         }
                     });
+                    // Register this connection's abort handle so
+                    // `disable_socks5_server` can kill it. Prune
+                    // finished entries while we hold the lock so the
+                    // vec stays bounded over a long-lived listener.
+                    let mut g = conn_aborts_for_loop.lock();
+                    g.retain(|a| !a.is_finished());
+                    g.push(join.abort_handle());
                 }
                 Err(e) if is_transient_accept_error(&e) => {
                     log::warn!("socks5: transient accept err {e} — backing off 250ms");
@@ -248,6 +281,7 @@ pub(crate) async fn enable_listener(
     Ok(Socks5Handle {
         listener_abort: task.abort_handle(),
         local_addr,
+        conn_aborts,
     })
 }
 

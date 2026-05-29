@@ -160,13 +160,13 @@ val cargoBuild by tasks.registering(Exec::class) {
     inputs.file("$lktunnelCore/Cargo.toml")
     inputs.dir("$baleSignaling/src")
     inputs.file("$baleSignaling/Cargo.toml")
-    inputs.dir("$rustDir/lktunnel-android/src")
-    inputs.file("$rustDir/lktunnel-android/Cargo.toml")
-    inputs.dir("$rustDir/bale-signaling-android/src")
-    inputs.file("$rustDir/bale-signaling-android/Cargo.toml")
+    // Single merged JNI shim — see `lktunnel-jni/Cargo.toml` for
+    // the rationale. Produces `liblktunnel_jni.so`.
+    inputs.dir("$rustDir/lktunnel-jni/src")
+    inputs.file("$rustDir/lktunnel-jni/Cargo.toml")
     // Shared JNI helper crate (HandleRegistry + runtime + JVM
-    // cache + continuation bridge). Both shims depend on it,
-    // so edits here must invalidate the cached .so.
+    // cache + continuation bridge). Used by the merged shim, so
+    // edits here must invalidate the cached .so.
     inputs.dir("$rustDir/jni-shared/src")
     inputs.file("$rustDir/jni-shared/Cargo.toml")
     outputs.dir(rustJniLibs)

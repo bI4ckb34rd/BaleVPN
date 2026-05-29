@@ -25,7 +25,7 @@ gui     = ["dep:tao", "dep:wry", "dep:muda"]
 [dependencies]
 # The signaling stack — three crates layered top-down.
 lk-signaling   = { path = "../../lk-signaling-rust/lk-signaling" }
-bale-signaling = { path = "../../bale-signaling-rust/bale-signaling", features = ["lktunnel"] }
+bale-signaling = { path = "../../bale-signaling-rust/bale-signaling" }
 lktunnel       = { path = "../../lktunnel-rust/lktunnel" }
 
 # Async runtime + concurrency primitives.

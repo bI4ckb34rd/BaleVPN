@@ -10,20 +10,19 @@ use crate::ws::{CallEntity, WsClient};
 
 use async_trait::async_trait;
 use lk_signaling::{
-    Callback, CallDecision, ContactPage, EndReason, IncomingHandler, Notify,
-    PeerId, PlaceCallError, Signaling, SignalingError, TokenStore, TransportSession,
+    CallDecision, ContactPage, EndReason, IncomingHandler,
+    PeerId, PlaceCallError, Signaling, SignalingError, SignalingEvent,
+    TokenStore, TransportSession, TunnelHooks,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
-// Internal `Arc<dyn …>` aliases. The trait surface accepts
-// `Box<…>` (matching the lk_signaling type aliases); we convert
-// to `Arc` on receipt so the WS listener callbacks can cheaply
-// clone the handler / callback into a spawned task.
+// Internal incoming-handler Arc alias — the trait surface takes
+// `Box<dyn IncomingHandler>` and we convert to `Arc` on receipt
+// so the WS listener can clone into spawned tasks.
 type ArcIncoming = Arc<dyn IncomingHandler>;
-type ArcCb<T>    = Arc<dyn Fn(T) + Send + Sync + 'static>;
-type ArcNotify   = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub struct BaleSignaling {
     ws:           Arc<WsClient>,
@@ -35,8 +34,8 @@ pub struct BaleSignaling {
     http:         reqwest::Client,
 
     /// Cached unfiltered contact list. Populated on the first
-    /// `list_contacts(query=None)` call and invalidated when
-    /// `on_contacts_changed` fires (TODO once WS surfaces
+    /// `list_contacts(query=None)` call and invalidated on a
+    /// `ContactsChanged` event (TODO once WS surfaces
     /// contact-update pushes). Hand-rolled pagination cursors
     /// index into this Vec.
     contact_cache: Mutex<Option<Vec<UserEntity>>>,
@@ -45,19 +44,18 @@ pub struct BaleSignaling {
     /// invariant.
     peer_cache:   Mutex<HashMap<i32, PeerId>>,
 
-    // ── Trait callback slots (stored as Arcs internally) ──────
-    on_auth_expired:      Mutex<Option<ArcNotify>>,
-    on_protocol_obsolete: Mutex<Option<ArcNotify>>,
-    on_call_ended:        Mutex<Option<ArcCb<(PeerId, EndReason)>>>,
-    on_session_ready:     Mutex<Option<ArcCb<(PeerId, TransportSession)>>>,
-    on_contacts_changed:  Mutex<Option<ArcNotify>>,
-    incoming_handler:     Mutex<Option<ArcIncoming>>,
+    /// Sender for the unified [`SignalingEvent`] stream. `None`
+    /// until [`Self::events`] is called. WS callbacks push
+    /// `AuthExpired` / `ProtocolObsolete` / `CallEnded` /
+    /// `ContactsChanged` here.
+    events_tx:        Mutex<Option<mpsc::UnboundedSender<SignalingEvent>>>,
+    incoming_handler: Mutex<Option<ArcIncoming>>,
 
     /// `call_id → PeerId` for every call this instance is
     /// tracking, regardless of direction. Populated by
     /// `place_call` (outgoing) and the IncomingHandler::Accept
     /// path (incoming); drained when the WS-level callEnded
-    /// event arrives and fires [`on_call_ended`].
+    /// event arrives and emits `SignalingEvent::CallEnded`.
     active_peers:         Mutex<HashMap<i64, PeerId>>,
 
     /// `call_id`s currently being processed in
@@ -69,6 +67,26 @@ pub struct BaleSignaling {
     /// are removed when the per-call task returns (any path —
     /// accept / reject / silent ignore / failure).
     in_flight_calls:      Mutex<HashSet<i64>>,
+
+    /// Sender for the [`TransportSession`] stream consumed by
+    /// the lktunnel-side manager. `None` until
+    /// [`Self::accepted_sessions`] is called.
+    accepted_tx:    Mutex<Option<mpsc::UnboundedSender<(PeerId, TransportSession)>>>,
+    /// Monotonic teardown counter surfaced via
+    /// [`TunnelHooks::subscribe_teardown`]. Incremented by both
+    /// `sign_out` and `disconnect` so the server manager kills
+    /// active sessions in lock-step with either user-initiated
+    /// teardown.
+    teardown_count: tokio::sync::watch::Sender<u64>,
+    /// Multi-subscriber fan-out for `CallEnded` events surfaced
+    /// to managers via [`TunnelHooks::subscribe_call_ended`].
+    /// Separate from `events_tx` (which is single-consumer for
+    /// app use) so the [`crate::ClientTunnelManager`] /
+    /// [`crate::ServerTunnelManager`] can subscribe without
+    /// stealing the app's `events()` slot. Closed senders are
+    /// pruned on the next emit; the vec grows only with live
+    /// subscribers (one per manager).
+    call_ended_subs: Mutex<Vec<mpsc::UnboundedSender<(PeerId, EndReason)>>>,
 }
 
 /// RAII guard that removes a call_id from `in_flight_calls` on
@@ -91,21 +109,18 @@ impl BaleSignaling {
             ws:                   WsClient::new(),
             token_store,
             http:                 grpc_web::build_client(),
-            contact_cache:        Mutex::new(None),
-            peer_cache:           Mutex::new(HashMap::new()),
-            on_auth_expired:      Mutex::new(None),
-            on_protocol_obsolete: Mutex::new(None),
-            on_call_ended:        Mutex::new(None),
-            on_session_ready:     Mutex::new(None),
-            on_contacts_changed:  Mutex::new(None),
-            incoming_handler:     Mutex::new(None),
-            active_peers:         Mutex::new(HashMap::new()),
-            in_flight_calls:      Mutex::new(HashSet::new()),
+            contact_cache:    Mutex::new(None),
+            peer_cache:       Mutex::new(HashMap::new()),
+            events_tx:        Mutex::new(None),
+            incoming_handler: Mutex::new(None),
+            active_peers:     Mutex::new(HashMap::new()),
+            in_flight_calls:  Mutex::new(HashSet::new()),
+            accepted_tx:      Mutex::new(None),
+            teardown_count:   tokio::sync::watch::channel(0u64).0,
+            call_ended_subs:  Mutex::new(Vec::new()),
         });
         me.setup_ws_listeners();
         me.setup_auth_callbacks();
-        #[cfg(feature = "lktunnel")]
-        me.setup_lktunnel_observer();
         me
     }
 
@@ -125,31 +140,6 @@ impl BaleSignaling {
         }
     }
 
-    /// Install a process-wide observer on the LK transport so any
-    /// [`lktunnel::LkTunnel`] anywhere in the process flips the WS
-    /// rule engine's `call_active` flag on Connected /
-    /// Disconnected. Net effect: WS auto-pauses for the duration
-    /// of any call.
-    ///
-    /// Disabled on Android (the `lktunnel` feature is off there)
-    /// because libwebrtc can't safely be linked into more than one
-    /// .so in the same process — Android's Kotlin shim calls
-    /// `set_call_active` explicitly instead.
-    #[cfg(feature = "lktunnel")]
-    fn setup_lktunnel_observer(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
-        lktunnel::set_global_observer(Some(std::sync::Arc::new(
-            move |ev: lktunnel::Event| {
-                let Some(me) = weak.upgrade() else { return };
-                match ev.kind {
-                    lktunnel::EventKind::Connected    => me.ws.set_call_active(true),
-                    lktunnel::EventKind::Disconnected => me.ws.set_call_active(false),
-                    _ => {}
-                }
-            },
-        )));
-    }
-
     /// API-level connect intent. True iff there's a token AND
     /// the user hasn't explicitly disconnected. Different from
     /// [`Signaling::is_connected`] (wire-level handshake-done):
@@ -166,28 +156,6 @@ impl BaleSignaling {
         self.ws.has_token() && !self.ws.is_user_disconnected()
     }
 
-    // ── Rule-engine input pushers (not in the lk_signaling
-    //    trait — Bale-specific surface for apps that want to feed
-    //    foreground / call_active / mode into the WS lifecycle
-    //    policy. The lib owns the rule; the app just pushes
-    //    state.). ────────────────────────────────────────────────
-
-    /// App in foreground? Client-mode only — Server-mode ignores.
-    pub fn set_foreground(&self, fg: bool) { self.ws.set_foreground(fg); }
-
-    /// LK call active? Library uses this to pause the WS during a
-    /// call in client mode. Wired automatically by
-    /// [`Self::place_call_with_tunnel`] / accepted incoming
-    /// sessions — apps don't normally call this directly.
-    pub fn set_call_active(&self, active: bool) { self.ws.set_call_active(active); }
-
-    /// Server foreground service running. Push `true` from the
-    /// server-mode foreground service's `onStartCommand`, `false`
-    /// from `stopServer`. The rule engine uses this to apply
-    /// server semantics (WS always on) vs client semantics (WS
-    /// gates on foreground + !call_active).
-    pub fn set_server_active(&self, active: bool) { self.ws.set_server_active(active); }
-
     /// True while the WS run loop is actively trying to
     /// connect / reconnect. UI's "Connecting…" indicator —
     /// distinct from [`Self::is_connect_requested`] (user
@@ -195,66 +163,6 @@ impl BaleSignaling {
     /// intentionally hasn't spawned the loop.
     pub fn ws_is_attempting_connect(&self) -> bool { self.ws.is_attempting_connect() }
 
-    /// Outgoing-call entry point. Combines the trait's
-    /// [`Signaling::place_call`] with internal LkTunnel
-    /// construction. Disabled when the `lktunnel` feature is off
-    /// (Android JNI build) — apps build LkTunnel themselves and
-    /// call `set_call_active` directly.
-    #[cfg(feature = "lktunnel")]
-    pub async fn place_call_with_tunnel<F>(
-        self: &Arc<Self>,
-        peer: PeerId,
-        extra_on_event: F,
-    ) -> Result<Arc<lktunnel::LkTunnel>, PlaceCallError>
-    where
-        F: Fn(lktunnel::Event) + Send + Sync + 'static,
-    {
-        let session = <Self as Signaling>::place_call(self.as_ref(), peer).await?;
-        Ok(self.wrap_lk_session(session, false, extra_on_event))
-    }
-
-    /// Server-side analogue — wraps an accepted incoming session.
-    #[cfg(feature = "lktunnel")]
-    pub fn wrap_incoming_session<F>(
-        self: &Arc<Self>,
-        session: TransportSession,
-        extra_on_event: F,
-    ) -> Arc<lktunnel::LkTunnel>
-    where
-        F: Fn(lktunnel::Event) + Send + Sync + 'static,
-    {
-        self.wrap_lk_session(session, true, extra_on_event)
-    }
-
-    #[cfg(feature = "lktunnel")]
-    fn wrap_lk_session<F>(
-        self: &Arc<Self>,
-        session: TransportSession,
-        server_role: bool,
-        extra_on_event: F,
-    ) -> Arc<lktunnel::LkTunnel>
-    where
-        F: Fn(lktunnel::Event) + Send + Sync + 'static,
-    {
-        let _ = &session.peer_id;    // PeerId tracked via active_peers
-        let weak = Arc::downgrade(self);
-        let on_event = move |ev: lktunnel::Event| {
-            if let Some(me) = weak.upgrade() {
-                match ev.kind {
-                    lktunnel::EventKind::Connected    => me.ws.set_call_active(true),
-                    lktunnel::EventKind::Disconnected => me.ws.set_call_active(false),
-                    _ => {}
-                }
-            }
-            extra_on_event(ev);
-        };
-        let tunnel = if server_role {
-            lktunnel::LkTunnel::connect_server(session.url, session.token, on_event)
-        } else {
-            lktunnel::LkTunnel::connect(session.url, session.token, on_event)
-        };
-        Arc::new(tunnel)
-    }
 
     /// Cache-hit-or-mint. The only sanctioned way to obtain a
     /// `PeerId` inside this impl — direct `PeerId::new(BalePeer
@@ -294,15 +202,21 @@ impl BaleSignaling {
             // user_disconnect is unchanged).
             me.token_store.clear();
             me.ws.set_token(None);
-            let cb = me.on_auth_expired.lock().clone();
-            if let Some(cb) = cb { cb(); }
+            me.emit_event(SignalingEvent::AuthExpired);
         }));
         let weak = Arc::downgrade(self);
         self.ws.set_on_version_mismatch(Arc::new(move || {
             let Some(me) = weak.upgrade() else { return; };
-            let cb = me.on_protocol_obsolete.lock().clone();
-            if let Some(cb) = cb { cb(); }
+            me.emit_event(SignalingEvent::ProtocolObsolete);
         }));
+    }
+
+    /// Push an event onto the unified [`Signaling::events`]
+    /// stream. Silent no-op when no consumer is subscribed.
+    fn emit_event(&self, ev: SignalingEvent) {
+        if let Some(tx) = self.events_tx.lock().as_ref() {
+            let _ = tx.send(ev);
+        }
     }
 
     fn setup_ws_listeners(self: &Arc<Self>) {
@@ -391,13 +305,20 @@ impl BaleSignaling {
                 // Track so a later callEnded fires on_call_ended.
                 self.active_peers.lock().insert(call_id, peer.clone());
 
-                let cb = self.on_session_ready.lock().clone();
-                if let Some(cb) = cb {
-                    cb((peer.clone(), TransportSession {
-                        url:     accepted.url,
-                        token:   accepted.token,
-                        peer_id: peer,
-                    }));
+                let transport = TransportSession {
+                    url:     accepted.url,
+                    token:   accepted.token,
+                    peer_id: peer.clone(),
+                };
+                // Surface the transport to whichever consumer (the
+                // lktunnel manager, typically) has subscribed to
+                // `accepted_sessions`. If nobody's subscribed yet,
+                // the session is dropped silently — there's no
+                // backlog by design.
+                if let Some(tx) = self.accepted_tx.lock().as_ref() {
+                    let _ = tx.send((peer, transport));
+                } else {
+                    log::warn!("incoming call accepted but no accepted_sessions consumer; dropping");
                 }
             }
             CallDecision::Reject => {
@@ -412,18 +333,27 @@ impl BaleSignaling {
     }
 
     /// Sync callEnded dispatcher. Looks up the peer for this
-    /// call_id in [`Self::active_peers`] and fires the
-    /// (single) `on_call_ended` callback. Apps discriminate
-    /// outgoing-vs-incoming on their own side from the per-peer
-    /// state they built at `place_call` / `on_session_ready` time.
+    /// call_id in [`Self::active_peers`], fans the event out to
+    /// the manager-internal [`TunnelHooks::subscribe_call_ended`]
+    /// subscribers (so the managers can enforce the
+    /// "LK-authoritative" rule centrally), and emits
+    /// [`SignalingEvent::CallEnded`] on the unified events
+    /// stream for app consumers.
     fn on_call_ended_internal(&self, call_id: i64, discard_reason: i32) {
         let Some(peer) = self.active_peers.lock().remove(&call_id) else {
             log::debug!("callEnded for unknown call_id={call_id} (discard_reason={discard_reason})");
             return;
         };
         let reason = map_discard_reason(discard_reason);
-        let cb = self.on_call_ended.lock().clone();
-        if let Some(cb) = cb { cb((peer, reason)); }
+        // Fan out to manager subscribers first — prune any sender
+        // whose receiver was dropped so the vec doesn't grow.
+        self.call_ended_subs.lock().retain(|tx| {
+            tx.send((peer.clone(), reason.clone())).is_ok()
+        });
+        self.emit_event(SignalingEvent::CallEnded {
+            peer_id: peer,
+            reason,
+        });
     }
 }
 
@@ -500,6 +430,10 @@ impl Signaling for BaleSignaling {
     }
 
     async fn disconnect(&self) {
+        // Notify subscribers first — server manager
+        // `disconnect_all()`s its sessions so peers see clean
+        // LK drops before the WS comes down.
+        self.teardown_count.send_modify(|c| *c = c.wrapping_add(1));
         // Sticky "user disconnected" — rule engine flips WS down
         // regardless of foreground / mode. Token is preserved so
         // a subsequent `connect()` doesn't need re-auth.
@@ -507,59 +441,30 @@ impl Signaling for BaleSignaling {
     }
 
     async fn sign_out(&self) {
+        // Same teardown signal as `disconnect` — server manager
+        // tears its sessions down before we clear auth.
+        self.teardown_count.send_modify(|c| *c = c.wrapping_add(1));
         // Token cleared → rule engine sees no auth → WS goes down.
         self.ws.set_token(None);
         self.token_store.clear();
     }
 
-    fn is_authenticated(&self) -> bool { self.token_store.load().is_some() }
+    fn events(&self) -> mpsc::UnboundedReceiver<SignalingEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.events_tx.lock() = Some(tx);
+        rx
+    }
 
-    fn on_auth_expired      (&self, cb: Notify) { *self.on_auth_expired.lock()      = Some(cb.into()); }
-    fn on_protocol_obsolete (&self, cb: Notify) { *self.on_protocol_obsolete.lock() = Some(cb.into()); }
+    fn is_authenticated(&self) -> bool { self.token_store.load().is_some() }
 
     async fn whoami(&self) -> Option<PeerId> {
         let info = self.ws.cached_self()?;
         Some(self.intern_peer(info.uid, 0, info.name))
     }
 
-    async fn place_call(&self, peer: PeerId) -> Result<TransportSession, PlaceCallError> {
-        let uid = peer.id_str().parse::<i32>().map_err(|_| PlaceCallError::NoPeer)?;
-        let peer_type = 1i32;   // PEERTYPE_PRIVATE
+    fn set_foreground(&self, fg: bool) { self.ws.set_foreground(fg); }
 
-        let call = self.ws.start_call(uid, peer_type).await
-            .ok_or_else(|| PlaceCallError::Transport("startCall returned no entity".into()))?;
-        if !call.is_livekit || call.token.is_empty() {
-            return Err(PlaceCallError::Transport(
-                "startCall reply had no LiveKit credentials".into()));
-        }
-
-        // Track for on_call_ended bookkeeping. The PeerId we
-        // hand out via TransportSession is the SAME Arc the
-        // caller passed in, satisfying the ptr-eq invariant.
-        self.active_peers.lock().insert(call.call_id, peer.clone());
-
-        Ok(TransportSession {
-            url:     call.url,
-            token:   call.token,
-            peer_id: peer,
-        })
-    }
-    fn on_call_ended(&self, cb: Callback<(PeerId, EndReason)>) {
-        *self.on_call_ended.lock() = Some(cb.into());
-    }
-
-    fn set_incoming_handler(&self, h: Box<dyn IncomingHandler>) {
-        *self.incoming_handler.lock() = Some(Arc::from(h));
-        // No mode flip here — server semantics are now driven by
-        // an explicit `set_server_active(true)` from the server
-        // service. Decoupling handler installation from server
-        // mode means a stale handler doesn't keep the rule engine
-        // in server mode after the service goes away.
-    }
-    fn on_session_ready(&self, cb: Callback<(PeerId, TransportSession)>) {
-        *self.on_session_ready.lock() = Some(cb.into());
-    }
-
+    fn tunnel_hooks(&self) -> &dyn TunnelHooks { self }
     async fn list_contacts(
         &self,
         query:  Option<&str>,
@@ -589,9 +494,6 @@ impl Signaling for BaleSignaling {
             .collect();
         let next = if end < users.len() { Some(end.to_string()) } else { None };
         Ok(ContactPage { peers, next_cursor: next })
-    }
-    fn on_contacts_changed(&self, cb: Notify) {
-        *self.on_contacts_changed.lock() = Some(cb.into());
     }
     async fn search_contact_by_phone(&self, phone: &str) -> Result<Vec<PeerId>, SignalingError> {
         let token = self.access_token_str()?;
@@ -644,6 +546,59 @@ impl Signaling for BaleSignaling {
     async fn resolve_peer(&self, s: &str) -> Option<PeerId> {
         let uid = s.parse::<i32>().ok()?;
         Some(self.intern_peer(uid, 0, None))
+    }
+}
+
+#[async_trait]
+impl TunnelHooks for BaleSignaling {
+    async fn place_call(&self, peer: PeerId) -> Result<TransportSession, PlaceCallError> {
+        let uid = peer.id_str().parse::<i32>().map_err(|_| PlaceCallError::NoPeer)?;
+        let peer_type = 1i32;   // PEERTYPE_PRIVATE
+
+        let call = self.ws.start_call(uid, peer_type).await
+            .ok_or_else(|| PlaceCallError::Transport("startCall returned no entity".into()))?;
+        if !call.is_livekit || call.token.is_empty() {
+            return Err(PlaceCallError::Transport(
+                "startCall reply had no LiveKit credentials".into()));
+        }
+
+        // Track for callEnded bookkeeping. The PeerId we hand
+        // out via TransportSession is the SAME Arc the caller
+        // passed in, satisfying the ptr-eq invariant.
+        self.active_peers.lock().insert(call.call_id, peer.clone());
+
+        Ok(TransportSession {
+            url:     call.url,
+            token:   call.token,
+            peer_id: peer,
+        })
+    }
+
+    fn set_incoming_handler(&self, h: Box<dyn IncomingHandler>) {
+        *self.incoming_handler.lock() = Some(Arc::from(h));
+    }
+
+    fn accepted_sessions(&self) -> mpsc::UnboundedReceiver<(PeerId, TransportSession)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.accepted_tx.lock() = Some(tx);
+        rx
+    }
+
+    fn activate  (&self) { self.ws.set_manager_active(true); }
+    fn deactivate(&self) { self.ws.set_manager_active(false); }
+
+    fn subscribe_foreground(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.ws.subscribe_foreground()
+    }
+
+    fn subscribe_teardown(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.teardown_count.subscribe()
+    }
+
+    fn subscribe_call_ended(&self) -> mpsc::UnboundedReceiver<(PeerId, EndReason)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.call_ended_subs.lock().push(tx);
+        rx
     }
 }
 
@@ -711,14 +666,10 @@ mod tests {
     // ── on_call_ended routing ─────────────────────────────────
 
     #[tokio::test]
-    async fn on_call_ended_fires_for_any_tracked_peer_with_discard_reason() {
+    async fn call_ended_emits_event_for_tracked_peer() {
         let s = BaleSignaling::new(store_empty());
 
-        let captured = Arc::new(Mutex::new(None::<(PeerId, EndReason)>));
-        let cap = captured.clone();
-        s.on_call_ended(Box::new(move |(peer, reason)| {
-            *cap.lock() = Some((peer, reason));
-        }));
+        let mut events = s.events();
 
         // Pre-record an active call (we'd normally do this via
         // place_call or the IncomingHandler::Accept path, but the
@@ -729,9 +680,14 @@ mod tests {
 
         s.on_call_ended_internal(123, 5);
 
-        let got = captured.lock().take().expect("on_call_ended should have fired");
-        assert_eq!(got.0, peer);
-        assert!(matches!(got.1, EndReason::Other(5)));
+        let ev = events.recv().await.expect("events stream should emit");
+        match ev {
+            SignalingEvent::CallEnded { peer_id, reason } => {
+                assert_eq!(peer_id, peer);
+                assert!(matches!(reason, EndReason::Other(5)));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
         assert!(s.active_peers.lock().is_empty());
     }
 

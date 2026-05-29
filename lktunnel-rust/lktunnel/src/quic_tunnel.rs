@@ -113,13 +113,12 @@ impl std::fmt::Debug for TunnelUdpSocket {
 }
 
 struct TunnelUdpSocketInner {
-    /// The LK tunnel we forward datagrams through. We hold a strong
-    /// `LkTunnel` (which is itself a cheap Arc clone) — when the
-    /// quinn endpoint is dropped, this socket is dropped, the
-    /// tunnel reference goes with it.
-    tunnel: LkTunnel,
+    /// Strong `Arc<LkTunnel>` we forward datagrams through —
+    /// when the quinn endpoint is dropped, this socket is
+    /// dropped and the tunnel reference goes with it.
+    tunnel: Arc<LkTunnel>,
     /// Receiver end of the per-tunnel QUIC inbound channel. The
-    /// matching sender lives in `LkTunnel::Inner::quic_rx_tx` and is
+    /// matching sender lives on `LkTunnel::quic_rx_tx` and is
     /// installed by `enable_quic_*` (stage 2). `dispatch_payload`
     /// produces into the sender; we consume here.
     rx: tokio::sync::mpsc::Receiver<Bytes>,
@@ -134,7 +133,7 @@ impl TunnelUdpSocket {
     /// installed on the tunnel via `enable_quic_*`. Together they
     /// turn the LK tunnel into a UDP-shaped transport quinn can
     /// drive.
-    pub fn new(tunnel: LkTunnel, rx: tokio::sync::mpsc::Receiver<Bytes>) -> Arc<Self> {
+    pub fn new(tunnel: Arc<LkTunnel>, rx: tokio::sync::mpsc::Receiver<Bytes>) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(TunnelUdpSocketInner {
                 tunnel,
@@ -266,7 +265,7 @@ impl quinn::AsyncUdpSocket for TunnelUdpSocket {
 /// `LkTunnel::on_send_drained`, which fires the registered callback
 /// either inline (queue has capacity right now) or once a slot frees.
 struct DrainPoller {
-    tunnel: crate::LkTunnel,
+    tunnel: Arc<crate::LkTunnel>,
 }
 
 impl std::fmt::Debug for DrainPoller {
@@ -485,12 +484,12 @@ pub struct QuicClient {
 /// for closure (idle timeout, peer crash, network blip) and re-runs
 /// `connect_quic_to_peer` with exponential backoff to bring up a
 /// fresh client. Lives for the tunnel's lifetime; exits when the
-/// Weak ref to `TunnelInner` upgrades to None (tunnel torn down).
+/// Weak ref to the tunnel upgrades to None (tunnel torn down).
 ///
 /// Spawned by [`crate::LkTunnel::ensure_quic_client`] on first
 /// successful connect.
 pub(crate) async fn keeper_task(
-    weak: std::sync::Weak<crate::TunnelInner>,
+    weak: std::sync::Weak<crate::LkTunnel>,
 ) {
     // Weak-only — must NOT hold a strong `LkTunnel` across
     // awaits or the explicit `disconnect()` path can't drop
@@ -515,6 +514,19 @@ pub(crate) async fn keeper_task(
         // Drop the connection clone before any further work so
         // `quic_client.take()` is the last strong ref.
         drop(conn);
+
+        // If the LK tunnel itself is being torn down, don't
+        // bother reconnecting — the keeper would spin on
+        // perma-failing dials until the tunnel's Arc count
+        // finally hits zero. `is_connected()` is the simplest
+        // proxy: `teardown()` flips it to `false` synchronously.
+        {
+            let Some(inner) = weak.upgrade() else { return };
+            if !inner.is_connected() {
+                log::info!("quic: tunnel torn down, keeper exiting");
+                return;
+            }
+        }
         log::warn!("quic: connection closed ({reason}) — reconnecting");
 
         // Drop the stale client / channel so connect_quic_to_peer
@@ -531,13 +543,12 @@ pub(crate) async fn keeper_task(
         // clears.
         let mut backoff = Duration::from_millis(500);
         loop {
-            // Upgrade-then-construct an LkTunnel for the
-            // duration of the connect call. The upgrade pins
-            // the inner for that call only; the strong ref is
-            // dropped before the next sleep so an explicit
-            // disconnect can free Inner immediately.
-            let Some(inner) = weak.upgrade() else { return };
-            let tunnel = crate::LkTunnel { inner };
+            // Bail if the LK tunnel was torn down while we slept.
+            let Some(tunnel) = weak.upgrade() else { return };
+            if !tunnel.is_connected() {
+                log::info!("quic: tunnel torn down mid-reconnect, keeper exiting");
+                return;
+            }
             let connect_result = tunnel.connect_quic_to_peer().await;
             drop(tunnel);
 
@@ -593,12 +604,12 @@ impl From<quinn::ConnectionError> for QuicEndpointError { fn from(e: quinn::Conn
 /// Build a quinn::Endpoint backed by a [`TunnelUdpSocket`] over
 /// `tunnel`. The caller has already obtained the receiver side of
 /// the per-tunnel inbound datagram channel (`rx`) and installed the
-/// matching sender into `tunnel.inner.quic_rx_tx`. Pass
+/// matching sender into `tunnel.quic_rx_tx`. Pass
 /// `Some(server_config)` to enable accepting incoming connections;
 /// pass `None` for client-only mode (will need
 /// `endpoint.set_default_client_config(...)` before connect).
 pub fn build_endpoint(
-    tunnel:        crate::LkTunnel,
+    tunnel:        Arc<crate::LkTunnel>,
     rx:            tokio::sync::mpsc::Receiver<bytes::Bytes>,
     server_config: Option<quinn::ServerConfig>,
 ) -> Result<quinn::Endpoint, QuicEndpointError> {

@@ -69,18 +69,37 @@ async fn run(url: String, token: String, mode: Mode) {
 }
 
 async fn run_nat_server(url: String, token: String) {
-    let on_event = |ev: lktunnel::Event| {
-        log::info!("event {:?} {}", ev.kind, ev.info);
-    };
-
     // Non-blocking: returns the handle immediately, dial runs in
-    // background. `await_connected` suspends until the room is joined
-    // (or fails / times out).
-    let tunnel = LkTunnel::connect(url.clone(), token, on_event);
-    if let Err(e) = tunnel.await_connected().await {
-        log::error!("LkTunnel::connect failed: {e}");
-        std::process::exit(1);
+    // background. Wait for Connected by draining the events
+    // stream — terminal Disconnected / Error before Connected
+    // means the dial failed.
+    let tunnel = LkTunnel::connect(url.clone(), token);
+    let mut events = match tunnel.events() {
+        Some(rx) => rx,
+        None     => { log::error!("LkTunnel events already taken"); std::process::exit(1); }
+    };
+    loop {
+        match events.recv().await {
+            Some(ev) => {
+                log::info!("event {:?} {}", ev.kind, ev.info);
+                match ev.kind {
+                    lktunnel::EventKind::Connected    => break,
+                    lktunnel::EventKind::Error |
+                    lktunnel::EventKind::Disconnected => {
+                        log::error!("LkTunnel::connect failed: {}", ev.info);
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
+            }
+            None => { log::error!("LkTunnel events stream closed"); std::process::exit(1); }
+        }
     }
+    tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            log::info!("event {:?} {}", ev.kind, ev.info);
+        }
+    });
     log::info!("joined LiveKit room at {url}");
 
     if let Err(e) = tunnel.start_server() {

@@ -1,8 +1,5 @@
 package ai.bale.proxy
 
-import ai.bale.proxy.bale.BaleEvent
-import ai.bale.proxy.bale.BaleIncomingHandler
-import ai.bale.proxy.bale.CallDecision
 import ai.bale.proxy.tunnel.LiveKitStats
 import ai.bale.proxy.tunnel.PacketStats
 import android.app.*
@@ -11,6 +8,7 @@ import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.onSubscription
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG                = "BaleProxy"
@@ -202,42 +200,76 @@ class BaleServerService : Service() {
         BlacklistStore.init(prefs)
         debug           = prefs.getBoolean("packet_debug",     false)
 
-        // Install the admission policy on the signaling layer.
-        // The handler is called per incoming call; its async
-        // decision (Accept / Reject / SilentlyIgnore) drives
-        // BaleSignaling's internal acceptCall / discardCall RPCs.
-        // Successful Accepts surface back via the SessionReady
-        // event collected below.
-        BaleConnection.signaling?.setIncomingHandler(BaleIncomingHandler { peerIdStr, displayName ->
-            val live = instance
-            if (live == null || !live.scope.isActive) {
-                Log.w(TAG, "Server: incoming from $peerIdStr but service scope is gone (instance=${live != null})")
-                return@BaleIncomingHandler CallDecision.SilentlyIgnore
-            }
-            val callerId = peerIdStr.toLongOrNull() ?: return@BaleIncomingHandler CallDecision.SilentlyIgnore
-            live.decideIncoming(callerId, displayName)
-        })
-        // Tell the WS rule engine we're in server semantics — WS
-        // stays up unconditionally (modulo token + user_disconnect)
-        // so we can receive incoming callReceived pushes.
-        BaleConnection.signaling?.setServerActive(true)
-
-        // Subscribe to signaling events for accepted-session
-        // lifecycle. SessionReady fires once the impl has run
-        // acceptCall and has LK creds; SessionEnded/CallEnded
-        // fire when the call terminates from the peer side.
-        scope.launch {
-            BaleConnection.signaling?.events?.collect { ev ->
-                when (ev) {
-                    is BaleEvent.SessionReady -> handleSessionReady(ev)
-                    is BaleEvent.CallEnded    -> onCallEndedRemote(ev.peerId.toLongOrNull() ?: 0L)
-                    else -> Unit
-                }
-            }
+        // Construct the server tunnel manager. Its constructor:
+        //   1. installs an IncomingHandler on the signaling impl
+        //      that delegates to our [AdmissionDecider];
+        //   2. activates the signaling impl (pinned active for
+        //      the manager's lifetime — server mode ignores
+        //      foreground);
+        //   3. subscribes to sign-out so a UI sign-out auto-
+        //      disconnects every live session.
+        // Close on `stopServer` deactivates.
+        // Swap BaleConnection to server-mode — closes the
+        // ClientTunnelManager and constructs the ServerTunnelManager
+        // we'll use. The server manager pins activation so the WS
+        // stays up regardless of foreground state.
+        BaleConnection.setMode(Mode.SERVER)
+        val mgr = BaleConnection.serverMgr
+        if (mgr == null) {
+            Log.e(TAG, "Server: BaleSignaling not initialised — incoming calls disabled")
         }
 
-        if (!loopsStarted) {
+        // All scope.launch{} below are subscription-creating and
+        // MUST be guarded by `loopsStarted` — Android can fire
+        // onStartCommand repeatedly under START_STICKY (sticky
+        // restart, redundant startService calls, …) and each
+        // unguarded launch piles on another collector on the same
+        // SharedFlow. Symptoms when ungated: a single Rust
+        // Connected delivers N times into handleSession, racing
+        // multiple startServer() calls for one tunnel.
+        if (!loopsStarted && mgr != null) {
             loopsStarted = true
+            val subscribed = CompletableDeferred<Unit>()
+            scope.launch {
+                mgr.events
+                    .onSubscription {
+                        Log.i(TAG, "Server: collector subscribed")
+                        subscribed.complete(Unit)
+                    }
+                    .collect { ev ->
+                        Log.i(TAG, "Server: collector received $ev")
+                        when (ev) {
+                            is SessionEvent.Connected    -> handleSession(ev.peerId, ev.tunnelHandle)
+                            is SessionEvent.Disconnected -> handleSessionEnded(ev.peerId.toLongOrNull() ?: 0L)
+                            is SessionEvent.Failed       -> {
+                                Log.w(TAG, "Server: session for ${ev.peerId} failed to connect")
+                                handleSessionEnded(ev.peerId.toLongOrNull() ?: 0L)
+                            }
+                        }
+                    }
+            }
+            scope.launch {
+                subscribed.await()
+                mgr.setAdmission(AdmissionDecider { peerIdStr, displayName ->
+                    val live = instance
+                    if (live == null || !live.scope.isActive) {
+                        Log.w(TAG, "Server: incoming from $peerIdStr but service scope is gone")
+                        return@AdmissionDecider CallDecision.SilentlyIgnore
+                    }
+                    val callerId = peerIdStr.toLongOrNull()
+                        ?: return@AdmissionDecider CallDecision.SilentlyIgnore
+                    live.decideIncoming(callerId, displayName)
+                })
+            }
+            // No WS-CallEnded subscriber here either: the
+            // `ServerTunnelManager` enforces the "LK is the
+            // sole authority once joined" rule centrally.
+            // Active-session peers' CallEnded is silently
+            // ignored; pending-admission peers' CallEnded
+            // cancels the in-flight `decide()` and surfaces
+            // as `SessionEvent.Failed` on the manager stream,
+            // which `handleSessionEnded` already drops the
+            // pending entry for.
             scope.launch { pendingSweepLoop() }
             scope.launch { statsLoop() }
         }
@@ -260,12 +292,15 @@ class BaleServerService : Service() {
     private suspend fun decideIncoming(callerId: Long, displayName: String?): CallDecision {
         Log.d(TAG, "Server: incoming callerId=$callerId allowed=${AdmissionStore.isAllowed(callerId)}")
 
-        // Blocked callers: silent reject. Their last-known
-        // disconnect already showed in the UI; this is the gate
-        // that enforces "we said we were done with you".
+        // Blocked callers: explicit reject so the caller's UI
+        // sees the call terminate immediately rather than
+        // waiting for a timeout. The discardCall message
+        // surfaces on the caller side as `EndReason::Rejected`
+        // (mapped from Bale's discardReason) and they can act
+        // on it right away.
         if (BlacklistStore.isBlocked(callerId)) {
             Log.d(TAG, "Server: rejecting blacklisted callerId=$callerId")
-            return CallDecision.SilentlyIgnore
+            return CallDecision.Reject
         }
 
         // Capacity gate. Applies to allowed and not-yet-allowed
@@ -294,46 +329,31 @@ class BaleServerService : Service() {
         return deferred.await()
     }
 
-    /** Called when the impl has produced LK creds for an accepted
-     *  call. Builds the LkTunnel, records the Client, posts the
-     *  notification. Replaces the pre-migration handleCall +
-     *  acceptAndStart pair. */
-    private fun handleSessionReady(ev: BaleEvent.SessionReady) {
-        val callerId = ev.peerId.toLongOrNull() ?: 0L
-        val callId   = callerId       // peer-uid doubles as the local call key
-        Log.d(TAG, "Server: SessionReady for $callerId")
+    /** Consumer of [ServerTunnelManager.events]'s `Connected`
+     *  arm. The library has already built + registered the
+     *  [LkTunnel] for this call; we wrap the handle, install
+     *  the Client entry, and drive `startServer()` to bring up
+     *  the userspace NAT. No `onDisconnected` wiring here — the
+     *  manager's `Disconnected` event drives the matching
+     *  cleanup via [onCallEndedRemote]. */
+    private fun handleSession(peerIdStr: String, tunnelHandle: Long) {
+        val callerId = peerIdStr.toLongOrNull() ?: run {
+            Log.w(TAG, "Server: handleSession: non-numeric peerId=$peerIdStr")
+            return
+        }
+        val callId = callerId   // peer-uid doubles as the local call key
+        Log.d(TAG, "Server: new session for callerId=$callerId handle=$tunnelHandle")
 
-        // Clear matching pending entry now that the call is up.
         pendingMap.remove(callerId)?.let {
             pendingSnapshot = pendingMap.values.toList()
             cancelPendingNotificationIfEmpty()
         }
         pendingDecisions.remove(callerId)
 
-        // Dedup: an old client for the same caller (e.g.
-        // reconnect before previous callEnded landed) — tear it
-        // down locally.
-        clients.values.firstOrNull { it.callerId == callerId }?.let { existing ->
-            Log.d(TAG, "Server: replacing existing client ${existing.callId} from callerId=$callerId")
-            cleanupClientLocal(existing.callId)
-        }
-
         scope.launch {
-            // Resolve caller name once — postClientEvent uses it
-            // for both connect AND disconnect labels.
-            val callerName: String? = BaleConnection.signaling?.fetchDisplayName(callerId.toString())
-
-            val transport = LkTunnel()
-            val client    = Client(callId, callerId, transport, resolvedName = callerName)
-
-            transport.onDisconnected = {
-                Log.d(TAG, "Server: client $callId disconnected")
-                val removed = clients.remove(callId)?.also { it.transport.disconnect() }
-                clientCount = clients.size
-                rebuildSnapshot()
-                updateNotification()
-                postClientEvent(callerId, "disconnected", removed?.resolvedName ?: callerName)
-            }
+            val callerName = BaleConnection.signaling?.fetchDisplayName(callerId.toString())
+            val transport  = LkTunnel(tunnelHandle)
+            val client     = Client(callId, callerId, transport, resolvedName = callerName)
 
             clients[callId] = client
             clientCount = clients.size
@@ -342,15 +362,10 @@ class BaleServerService : Service() {
             postClientEvent(callerId, "connected", callerName)
 
             try {
-                // Server-role tunnel — auto-warm of the client
-                // QUIC is suppressed inside the native core, so
-                // [startServer] claims the QUIC role uncontested.
-                transport.connectAsServer(ev.url, ev.token)
                 transport.startServer()
             } catch (e: Exception) {
-                Log.w(TAG, "Server: transport.connect failed for $callId: ${e::class.simpleName}: ${e.message}")
-                try { transport.disconnect() } catch (_: Exception) {}
-                clients.remove(callId)
+                Log.w(TAG, "Server: startServer failed for $callId: ${e::class.simpleName}: ${e.message}")
+                clients.remove(callId, client)
                 clientCount = clients.size
                 rebuildSnapshot()
                 updateNotification()
@@ -394,56 +409,6 @@ class BaleServerService : Service() {
         if (addToBlacklist && callerId != 0L) BlacklistStore.add(callerId)
     }
 
-    /** Builds the Client / transport / NAT-side tunnel for an accepted call.
-     *  Called by handleCall once LK creds are in hand from the acceptCall RPC. */
-    private suspend fun acceptAndStart(
-        callId: Long, callerId: Long, callerName: String?,
-        url: String, token: String,
-    ) {
-        val transport = LkTunnel()
-        val client = Client(callId, callerId, transport, resolvedName = callerName)
-
-        transport.onDisconnected = {
-            Log.d(TAG, "Server: client $callId disconnected")
-            val removed = clients.remove(callId)?.also { it.transport.disconnect() }
-            clientCount = clients.size
-            rebuildSnapshot()
-            updateNotification()
-            postClientEvent(callerId, "disconnected", removed?.resolvedName ?: callerName)
-        }
-
-        clients[callId] = client
-        clientCount = clients.size
-        rebuildSnapshot()
-        updateNotification()
-        postClientEvent(callerId, "connected", callerName)
-
-        Log.d(TAG, "Server: joining LK room for call $callId")
-        // Rust handles the LK data channel internally — once connect returns,
-        // inbound packets flow Rust → NAT → host sockets and outbound flow
-        // back the other way. If connect throws (ICE failure, peer never
-        // joined within Rust's PEER_WAIT_MS, etc.) we tear the call down
-        // cleanly so we don't leak the tunnel or leave UI stale.
-        try {
-            // Server-role tunnel — see handleCall for the why.
-            transport.connectAsServer(url, token)
-            // LK is up — pick server mode on the underlying tunnel so the
-            // Rust shim wires the NAT dispatcher for this call.
-            transport.startServer()
-        } catch (e: Exception) {
-            Log.w(TAG, "Server: transport.connect failed for $callId: ${e::class.simpleName}: ${e.message}")
-            try { transport.disconnect() } catch (_: Exception) {}
-            clients.remove(callId)
-            clientCount = clients.size
-            rebuildSnapshot()
-            updateNotification()
-            // No explicit discardCall — closing the LkTunnel
-            // above already triggers Bale's callEnded for the
-            // peer; the trait doesn't surface discardCall.
-            postClientEvent(callerId, "disconnected", callerName)
-        }
-    }
-
     // Auto-reject pending calls that have been waiting too long — the caller has likely
     // hung up by now and the notification is just clutter.
     private suspend fun pendingSweepLoop() {
@@ -469,19 +434,30 @@ class BaleServerService : Service() {
         }
     }
 
-    /** Called when the signaling layer reports that a call
-     *  ended (peer hung up, network drop, late rejection). Tears
-     *  down the matching client or pending entry so we don't
-     *  leak state. */
-    private fun onCallEndedRemote(callId: Long) {
+    /** LK-driven session end (manager `Disconnected` / `Failed`).
+     *  Tears down the matching active client and clears any
+     *  pending entry. This is the authoritative path — LK is
+     *  the sole source of truth for "session over" once both
+     *  parties have joined the room. */
+    private fun handleSessionEnded(callId: Long) {
         if (callId == 0L) return
         if (clients.containsKey(callId)) {
-            Log.d(TAG, "Server: callEnded $callId — tearing down active client")
+            Log.d(TAG, "Server: LK session ended for $callId — tearing down active client")
             scope.launch { doDisconnect(callId) }
         }
-        // Pending entry — caller hung up before user decided.
+        dropPendingEntry(callId)
+    }
+
+    /** Shared "pending caller went away" cleanup. Called from
+     *  [handleSessionEnded] when the manager surfaces a
+     *  `SessionEvent.Failed` for a peer that hadn't reached
+     *  active state — typically because the caller hung up
+     *  during the admission decision (the manager's
+     *  CallEnded handler cancels the in-flight `decide()`
+     *  and emits Failed). */
+    private fun dropPendingEntry(callId: Long) {
         pendingDecisions.remove(callId)?.let { p ->
-            Log.d(TAG, "Server: callEnded $callId — dropping pending entry (caller hung up)")
+            Log.d(TAG, "Server: dropping pending entry for $callId (caller hung up)")
             p.deferred.complete(CallDecision.SilentlyIgnore)
             pendingMap.remove(callId)
             pendingSnapshot = pendingMap.values.toList()
@@ -535,10 +511,10 @@ class BaleServerService : Service() {
         }
     }
 
-    // Like doDisconnect but skips the discardCall RPC. Used for dedup-replace where
-    // the "old" call may have already ended on the peer's side; sending discardCall
-    // for it triggers Bale to also end the *new* call we're about to accept (Bale
-    // appears to scope discardCall at the caller↔callee session level, not per-callId).
+    /** Drop the local Client entry + close its transport. Used
+     *  by [onCallEndedRemote]; the manager's per-peer registry
+     *  already disconnected the underlying tunnel by this point,
+     *  so the transport.disconnect() here is idempotent. */
     private fun cleanupClientLocal(callId: Long) {
         clients.remove(callId)?.also {
             Log.d(TAG, "Server: local cleanup of $callId")
@@ -551,12 +527,11 @@ class BaleServerService : Service() {
 
     private fun stopServer() {
         Log.d(TAG, "BaleServerService: stopping")
-        // Flip server_active off immediately so the WS rule
-        // engine reverts to client semantics. Done up-front so
-        // any subsequent state changes (foreground/background,
-        // call_active resets) are evaluated under the right
-        // semantics.
-        BaleConnection.signaling?.setServerActive(false)
+        // Hand BaleConnection back to client mode — closes the
+        // ServerTunnelManager (deactivates) and constructs a
+        // ClientTunnelManager whose foreground subscriber takes
+        // over the WS gating.
+        BaleConnection.setMode(Mode.CLIENT)
         isRunning       = false
         clientCount     = 0
         clientSnapshot  = emptyList()

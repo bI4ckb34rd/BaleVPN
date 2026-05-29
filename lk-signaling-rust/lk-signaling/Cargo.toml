@@ -18,6 +18,13 @@ crate-type = ["lib"]
 # attribute; drop it later if Rust's native support lands the
 # missing pieces.
 async-trait = "0.1"
+# `tokio::sync::watch` for the foreground / sign-out subscription
+# methods on the `Signaling` trait. `sync` feature only — no
+# runtime in the trait crate.
+tokio       = { version = "1", features = ["sync"] }
+# Process-lifetime statics for the trait's default subscription
+# methods (foreground + sign-out leaked-sender receivers).
+once_cell   = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }

@@ -204,22 +204,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bale-signaling-android"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "async-trait",
- "bale-signaling",
- "jni",
- "jni-shared",
- "lk-signaling",
- "log",
- "once_cell",
- "parking_lot",
- "tokio",
-]
-
-[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1479,17 +1463,21 @@ name = "lk-signaling"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "once_cell",
+ "tokio",
 ]
 
 [[package]]
 name = "lktunnel"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures-util",
  "libc",
  "livekit-api",
  "livekit-protocol",
+ "lk-signaling",
  "log",
  "mio",
  "once_cell",
@@ -1504,18 +1492,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "lktunnel-android"
+name = "lktunnel-jni"
 version = "0.1.0"
 dependencies = [
  "android_logger",
+ "async-trait",
+ "bale-signaling",
  "jni",
  "jni-shared",
  "libc",
+ "lk-signaling",
  "lktunnel",
  "log",
  "mio",
  "once_cell",
  "parking_lot",
+ "tokio",
 ]
 
 [[package]]
