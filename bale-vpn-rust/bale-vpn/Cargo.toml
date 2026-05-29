@@ -53,7 +53,7 @@ env_logger = "0.11"
 # frontend can be served verbatim once it's ported in.
 axum       = { version = "0.7", features = ["macros"] }
 tower      = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "cors", "set-header"] }
 
 # GUI deps — optional, gated by the `gui` feature. `tao` is the
 # windowing / event-loop crate (cross-platform), `wry` is the

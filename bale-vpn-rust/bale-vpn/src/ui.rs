@@ -18,7 +18,7 @@
 
 use crate::daemon::AppState;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -27,6 +27,7 @@ use lk_signaling::Signaling;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 /// Build the router. Caller spawns this against a TcpListener.
@@ -66,6 +67,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/tunnel/clients/:peer_id/disconnect", post(tunnel_client_disconnect))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+        // Blanket `Cache-Control: no-store` on every response.
+        // The embedded GUI webview (wry — WKWebView on macOS,
+        // WebView2 on Windows, WebKitGTK on Linux) otherwise
+        // caches `/state`, `/peers`, `/server/admission`, … and
+        // serves stale post-login pages from before the user
+        // authenticated, with no way to disable cache short of
+        // the user manually right-click→Reload. Regular browsers
+        // with devtools open mask this with their "Disable cache"
+        // checkbox. `no-store` (stricter than `no-cache`) tells
+        // every layer along the way — webview, intermediary
+        // proxies (none here, but defensive) — to neither store
+        // nor reuse the response.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
 }
 
 /// Bind + serve forever. Returns on listener accept-loop exit.
