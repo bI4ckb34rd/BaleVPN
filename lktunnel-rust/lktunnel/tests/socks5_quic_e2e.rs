@@ -138,22 +138,61 @@ async fn socks5_over_quic_loopback_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn enable_socks5_twice_errors() {
+async fn enable_socks5_same_port_is_idempotent() {
+    // Re-enabling on the *same* port (or with `port=0` =
+    // don't-care) returns the existing `SocketAddr` instead of
+    // erroring. Apps drift out of sync with the native listener
+    // state — UI toggle race against `startVpn`'s auto-enable,
+    // double-tap on the toggle — and the cleanest recovery is
+    // for the second enable to be a no-op-with-the-same-addr.
+    // Tested separately from the port-change case below.
     let _ = env_logger::builder().is_test(true).try_init();
     let (a, b) = lktunnel::connect_loopback();
     b.start_server().unwrap();
-    let _port = tokio::time::timeout(
+    let addr1 = tokio::time::timeout(
         Duration::from_secs(15),
         a.enable_socks5_server(0),
     )
     .await
     .expect("first enable timed out")
     .expect("first enable failed");
-    // Second enable should reject.
-    let err = a.enable_socks5_server(0).await.unwrap_err();
+    // Second enable with `port=0` — same `don't-care` intent.
+    let addr2 = a.enable_socks5_server(0).await
+        .expect("second enable (port=0) should be idempotent, not error");
+    assert_eq!(addr1, addr2,
+        "idempotent enable should return the existing bound addr");
+    // Third enable explicitly naming the bound port — same addr.
+    let addr3 = a.enable_socks5_server(addr1.port()).await
+        .expect("explicit same-port enable should be idempotent");
+    assert_eq!(addr1, addr3,
+        "explicit same-port enable should return the existing bound addr");
+    a.disable_socks5_server();
+    drop(a); drop(b);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn enable_socks5_different_port_errors() {
+    // Port changes still require an explicit disable→enable —
+    // returning the wrong port from a "please bind on X"
+    // request would silently mislead the caller. The Kotlin
+    // port-change handler in MainActivity does exactly this:
+    // disable, then enable on the new port.
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (a, b) = lktunnel::connect_loopback();
+    b.start_server().unwrap();
+    let addr1 = tokio::time::timeout(
+        Duration::from_secs(15),
+        a.enable_socks5_server(0),
+    )
+    .await
+    .expect("first enable timed out")
+    .expect("first enable failed");
+    // Pick any port that definitely isn't the one we got back.
+    let other_port = if addr1.port() == 12345 { 12346 } else { 12345 };
+    let err = a.enable_socks5_server(other_port).await.unwrap_err();
     assert!(matches!(err,
         lktunnel::socks5_quic::Socks5Error::AlreadyEnabled),
-        "expected AlreadyEnabled, got {err:?}");
+        "expected AlreadyEnabled on port change, got {err:?}");
     a.disable_socks5_server();
     drop(a); drop(b);
 }
