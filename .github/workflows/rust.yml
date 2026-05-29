@@ -139,10 +139,14 @@ jobs:
         working-directory: bale-signaling-rust
         run: cargo test --workspace --release
 
-      # The Android JNI shim depends on bale-signaling + jni;
-      # confirms the FFI shape compiles for the host target.
-      # The full Android build (cargo-ndk → arm64) is exercised
-      # by android.yml when a release tag is pushed.
+      # The Android JNI shim depends on bale-signaling + lktunnel
+      # + jni-shared; confirms the FFI shape compiles for the host
+      # target. The full Android build (cargo-ndk → arm64) is
+      # exercised by android.yml when a release tag is pushed.
+      #
+      # `lktunnel-jni` is the single merged shim (covers what used
+      # to be split across `lktunnel-android` + `bale-signaling-
+      # android`); produces `liblktunnel_jni.so`.
       - name: cargo build (android jni shim)
         working-directory: bale-vpn-android/rust
-        run: cargo build -p bale-signaling-android --release
+        run: cargo build -p lktunnel-jni --release

@@ -1,6 +1,6 @@
-# Helpers shared between the Android JNI shims (lktunnel-android +
-# bale-signaling-android). Lives in this workspace so it inherits
-# the vendored-crate patches; no external publishing.
+# Helpers consumed by the merged Android JNI shim (`lktunnel-jni`,
+# which covers what used to be split across `lktunnel-android` +
+# `bale-signaling-android`). No external publishing.
 [package]
 name        = "jni-shared"
 version     = "0.1.0"

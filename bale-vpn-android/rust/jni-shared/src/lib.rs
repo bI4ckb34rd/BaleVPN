@@ -1,7 +1,8 @@
-//! Shared utilities for the Android JNI shims.
+//! Shared utilities for the Android JNI shim.
 //!
-//! Centralises the handle-registry pattern both
-//! `lktunnel-android` and `bale-signaling-android` need:
+//! Centralises the handle-registry pattern that the merged
+//! `lktunnel-jni` shim (covering both the tunnel-side and
+//! signaling-side JNI surfaces) needs:
 //!   - mint opaque `jlong` handles for Rust-owned objects
 //!   - look them up by handle, keeping the borrow checker happy
 //!     across re-entrant native calls
