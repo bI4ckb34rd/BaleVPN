@@ -177,6 +177,57 @@ pub trait IncomingHandler: Send + Sync + 'static {
     async fn decide(&self, peer: PeerId, display_name: Option<String>) -> CallDecision;
 }
 
+// ─── The one notification primitive ─────────────────────────────────────
+
+/// Lossless multi-consumer fan-out — the single mechanism for every
+/// control-plane event stream in the stack. The source holds one
+/// `EventsSink` and calls [`emit`](Self::emit); each consumer gets its own
+/// unbounded `mpsc` receiver via [`subscribe`](Self::subscribe), and every
+/// emit is cloned to all of them.
+///
+/// Why this and not `mpsc` directly or `broadcast`:
+/// - plain `mpsc` is single-consumer — it can't feed the app *and* the
+///   managers the same `CallEnded`.
+/// - `broadcast` is multi-consumer but **drops** events for a consumer that
+///   lags past its ring buffer.
+///
+/// `EventsSink` is multi-consumer **and** lossless (unbounded per
+/// subscriber). The only cost is unbounded memory if a consumer stalls
+/// forever — fine for low-rate control events. A `subscribe()` only sees
+/// events emitted *after* it ran, so subscribe during wiring. For *current
+/// state* use a `watch` channel instead; this is for transient
+/// notifications only.
+pub struct EventsSink<E> {
+    subs: std::sync::Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<E>>>>,
+}
+
+impl<E> Clone for EventsSink<E> {
+    // Manual (not derive) so `Clone` doesn't require `E: Clone`.
+    fn clone(&self) -> Self { Self { subs: self.subs.clone() } }
+}
+
+impl<E: Clone> Default for EventsSink<E> {
+    fn default() -> Self { Self::new() }
+}
+
+impl<E: Clone> EventsSink<E> {
+    pub fn new() -> Self {
+        Self { subs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
+    }
+
+    /// A fresh receiver. Sees only events emitted after this call.
+    pub fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<E> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.subs.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// Fan out to every live subscriber, pruning any whose receiver dropped.
+    pub fn emit(&self, ev: E) {
+        self.subs.lock().unwrap().retain(|tx| tx.send(ev.clone()).is_ok());
+    }
+}
+
 /// Generic signaling errors. Most errors that matter to apps get
 /// their own typed return ([`PlaceCallError`], [`EndReason`]); this
 /// is the catch-all for the rest.
@@ -241,10 +292,16 @@ pub trait Signaling: Send + Sync {
     /// consequence of the auth state going away.
     async fn sign_out(&self);
 
-    /// Stream of async events — auth expired, protocol obsolete,
-    /// call ended, contacts changed. Single-consumer: calling
-    /// again replaces the receiver, no backlog kept for an
-    /// absent consumer.
+    /// Stream of async control-plane events — auth expired, protocol
+    /// obsolete, call ended, contacts changed. **Multi-consumer & lossless**
+    /// via the standard [`EventsSink`] fan-out: each call returns its own
+    /// `mpsc` receiver, so the app and the internal managers all see every
+    /// event (e.g. `CallEnded` reaches both managers *and* the app).
+    ///
+    /// Subscribe during wiring — a receiver only sees events emitted after
+    /// it subscribed. Connection *state* is NOT delivered here (see
+    /// [`Self::is_connected`]); only transient notifications are, so a late
+    /// subscriber can't miss durable state.
     fn events(&self) -> tokio::sync::mpsc::UnboundedReceiver<SignalingEvent>;
 
     // ── Auth state ─────────────────────────────────────────────────
@@ -410,36 +467,11 @@ pub trait TunnelHooks: Send + Sync {
         DEFAULT_TD.get_or_init(|| tokio::sync::watch::channel(0u64).0).subscribe()
     }
 
-    /// Manager-internal CallEnded fan-out. Returns a fresh
-    /// multi-subscriber receiver — every call gets its own
-    /// independent stream (no replace-on-subscribe). The
-    /// `ClientTunnelManager` / `ServerTunnelManager` each
-    /// subscribe at construction so they can enforce the
-    /// "LK-is-the-sole-authority once both parties joined the
-    /// room" rule centrally:
-    ///   * client manager: pre-LK CallEnded for the dialed
-    ///     peer → tear the tunnel down (watcher emits `Failed`);
-    ///     post-LK → ignored (a transient WS hiccup must not
-    ///     drop a live session).
-    ///   * server manager: CallEnded for a peer with an active
-    ///     LK session → ignored; for a peer with a pending
-    ///     admission decision → cancel the decision so the
-    ///     app's notification clears.
-    ///
-    /// Distinct from the unified [`Signaling::events`] stream
-    /// (which is single-consumer for app use): subscribers here
-    /// don't interfere with apps that have their own
-    /// `events()` consumer. Impls without call lifecycle return
-    /// the default — an immediately-closed stream that yields
-    /// `None` on first `recv`.
-    fn subscribe_call_ended(&self) -> tokio::sync::mpsc::UnboundedReceiver<(PeerId, EndReason)> {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        // `_tx` drops immediately → `rx.recv()` returns `None`
-        // straight away. Impls without call lifecycle (test
-        // doubles, future protocol bridges that don't model
-        // calls) get this freebie.
-        rx
-    }
+    // NOTE: there is intentionally no `subscribe_call_ended` here anymore.
+    // It used to be a separate manager-only fan-out because `events()` was
+    // single-consumer; now `events()` is multi-consumer (broadcast), so
+    // managers just subscribe to `events()` and match
+    // [`SignalingEvent::CallEnded`] — one stream, no duplication.
 }
 
 #[cfg(test)]

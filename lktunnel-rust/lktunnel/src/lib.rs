@@ -477,6 +477,17 @@ impl LkTunnel {
     /// compare via `Arc::ptr_eq` against any other tunnel handles
     /// it has.
     ///
+    /// This is an **ordered event stream** (mpsc), not [`Self::state`].
+    /// The two look redundant for Connected/Disconnected but are NOT: the
+    /// per-call watcher needs *every* transition in order (it bumps a
+    /// session counter on Connected and unbumps on Disconnected, and keys
+    /// supersession off the exact arrival sequence), so a coalescing
+    /// `watch` would drop a fast Connected→Disconnected and corrupt that
+    /// logic. `events()` is for **reactors**; `state()` is the coalescing
+    /// latest-value view for **pollers** (the UI). Single-consumer + the
+    /// buffer-from-construction below is why this stays mpsc, not the
+    /// multi-consumer `EventsSink` used for signaling/manager events.
+    ///
     /// Events that fire between `connect` returning and the
     /// receiver being taken are buffered (unbounded channel) and
     /// delivered on the first `recv()`.
@@ -587,7 +598,16 @@ impl LkTunnel {
     /// Subscribe to the per-tunnel [`TunnelState`] watch channel.
     /// Multi-reader: each call returns a fresh `watch::Receiver`,
     /// no contention with [`Self::events`] (which is the full
-    /// event stream, single-take). Use this when you only need
+    /// event stream, single-take).
+    ///
+    /// This is the **coalescing latest-value** view, for **pollers** — a
+    /// late reader gets the current state via `borrow()`, and intermediate
+    /// transitions may be collapsed. Do NOT use it where you must observe
+    /// *every* transition in order (e.g. counting up/down on
+    /// Connected/Disconnected) — that's what the [`Self::events`] ordered
+    /// stream is for. State→`watch` (poll), transitions→`events` (react).
+    ///
+    /// Use this when you only need
     /// the lifecycle state — typically as the low-level primitive
     /// in lktunnel-only embedders (the CLI, tests, internal
     /// helpers). Consumers built on top of `BaleSignaling` should

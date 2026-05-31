@@ -27,7 +27,8 @@
 
 use crate::LkTunnel;
 use lk_signaling::{
-    CallDecision, EndReason, IncomingHandler, PeerId, PlaceCallError, Signaling,
+    CallDecision, EndReason, EventsSink, IncomingHandler, PeerId, PlaceCallError, Signaling,
+    SignalingEvent,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -45,6 +46,10 @@ use tokio::sync::{mpsc, oneshot};
 ///   - `Disconnected`  — was Connected, now torn down.
 ///   - `Failed`        — never reached Connected (handshake
 ///                        failure, peer never joined, etc.).
+///
+/// `Clone` so the [`EventsSink`] fan-out can hand each subscriber its own
+/// copy (`peer_id` + an `Arc<LkTunnel>` handle — cheap).
+#[derive(Clone)]
 pub enum SessionEvent {
     Connected    { peer_id: PeerId, tunnel: Arc<LkTunnel> },
     Disconnected { peer_id: PeerId },
@@ -167,26 +172,8 @@ impl<S: Signaling + ?Sized + 'static> ActivationDriver<S> {
     }
 }
 
-// ─── Shared events sink ───────────────────────────────────────────────
-
-#[derive(Clone)]
-struct EventsSink {
-    tx: Arc<Mutex<Option<mpsc::UnboundedSender<SessionEvent>>>>,
-}
-
-impl EventsSink {
-    fn new() -> Self {
-        Self { tx: Arc::new(Mutex::new(None)) }
-    }
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<SessionEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.tx.lock() = Some(tx);
-        rx
-    }
-    fn send(&self, ev: SessionEvent) {
-        if let Some(tx) = self.tx.lock().as_ref() { let _ = tx.send(ev); }
-    }
-}
+// Manager → app `SessionEvent` notifications use the same lossless
+// multi-consumer fan-out as signaling events: `lk_signaling::EventsSink`.
 
 // ─── Client manager ────────────────────────────────────────────────────
 
@@ -208,7 +195,7 @@ struct CurrentCall {
 /// down the previous session.
 pub struct ClientTunnelManager<S: Signaling + ?Sized> {
     signaling: Arc<S>,
-    sink:      EventsSink,
+    sink:      EventsSink<SessionEvent>,
     /// Wrapped in `Arc` so the per-call watcher can clear its
     /// own entry on `Disconnected` (matches the server manager's
     /// `sessions` cleanup pattern). Apps no longer need an
@@ -244,12 +231,17 @@ impl<S: Signaling + ?Sized + 'static> ClientTunnelManager<S> {
         // Pre-LK: tear the tunnel down so the watcher emits
         // `Failed`. Post-LK: log + ignore; a transient WS hiccup
         // must not drop a live session.
-        let mut ce_rx = signaling.tunnel_hooks().subscribe_call_ended();
+        // Consume the unified signaling events() stream (its own fan-out
+        // subscriber) and act only on CallEnded — subscribed here at
+        // construction, before any call is placed, so none can be missed.
+        let mut events = signaling.events();
         let weak = Arc::downgrade(&me);
         tokio::spawn(async move {
-            while let Some((peer, reason)) = ce_rx.recv().await {
-                let Some(me) = weak.upgrade() else { return; };
-                me.on_ws_call_ended(peer, reason);
+            while let Some(ev) = events.recv().await {
+                if let SignalingEvent::CallEnded { peer_id, reason } = ev {
+                    let Some(me) = weak.upgrade() else { return; };
+                    me.on_ws_call_ended(peer_id, reason);
+                }
             }
         });
 
@@ -297,7 +289,7 @@ impl<S: Signaling + ?Sized + 'static> ClientTunnelManager<S> {
 }
 
 fn spawn_client_watcher<S>(
-    sink:    EventsSink,
+    sink:    EventsSink<SessionEvent>,
     driver:  Arc<ActivationDriver<S>>,
     current: Arc<Mutex<Option<CurrentCall>>>,
     peer:    PeerId,
@@ -357,7 +349,7 @@ fn spawn_client_watcher<S>(
                         break;
                     };
                     log::info!("client watcher: emitting Connected for {peer:?}");
-                    sink.send(SessionEvent::Connected { peer_id: peer.clone(), tunnel: t });
+                    sink.emit(SessionEvent::Connected { peer_id: peer.clone(), tunnel: t });
                 }
                 crate::EventKind::Disconnected => {
                     let was_current = clear_if_current();
@@ -381,14 +373,14 @@ fn spawn_client_watcher<S>(
                     }
                     if entered.load(Ordering::Acquire) {
                         log::info!("client watcher: emitting Disconnected for {peer:?}");
-                        sink.send(SessionEvent::Disconnected { peer_id: peer.clone() });
+                        sink.emit(SessionEvent::Disconnected { peer_id: peer.clone() });
                     } else {
                         // Never reached Connected — fail explicitly
                         // so the consumer can distinguish "failed
                         // to connect" from "was connected then
                         // dropped".
                         log::info!("client watcher: emitting Failed for {peer:?}");
-                        sink.send(SessionEvent::Failed { peer_id: peer.clone() });
+                        sink.emit(SessionEvent::Failed { peer_id: peer.clone() });
                     }
                     break;
                 }
@@ -408,7 +400,7 @@ type PendingMap = Arc<Mutex<HashMap<PeerId, oneshot::Sender<()>>>>;
 
 pub struct ServerTunnelManager<S: Signaling + ?Sized> {
     signaling: Arc<S>,
-    sink:      EventsSink,
+    sink:      EventsSink<SessionEvent>,
     sessions:  Arc<Mutex<HashMap<PeerId, Arc<LkTunnel>>>>,
     admission: Arc<Mutex<Option<Arc<dyn IncomingHandler>>>>,
     pending:   PendingMap,
@@ -487,12 +479,17 @@ impl<S: Signaling + ?Sized + 'static> ServerTunnelManager<S> {
         //   * peer with in-flight admission decision → cancel
         //     the decision (the user's notification clears) and
         //     surface Failed so the app drops its pending entry.
-        let mut ce_rx = signaling.tunnel_hooks().subscribe_call_ended();
+        // Consume the unified signaling events() stream (its own fan-out
+        // subscriber) and act only on CallEnded — subscribed here at
+        // construction, before any call is placed, so none can be missed.
+        let mut events = signaling.events();
         let weak = Arc::downgrade(&me);
         tokio::spawn(async move {
-            while let Some((peer, reason)) = ce_rx.recv().await {
-                let Some(me) = weak.upgrade() else { return; };
-                me.on_ws_call_ended(peer, reason);
+            while let Some(ev) = events.recv().await {
+                if let SignalingEvent::CallEnded { peer_id, reason } = ev {
+                    let Some(me) = weak.upgrade() else { return; };
+                    me.on_ws_call_ended(peer_id, reason);
+                }
             }
         });
 
@@ -514,7 +511,7 @@ impl<S: Signaling + ?Sized + 'static> ServerTunnelManager<S> {
         let was_pending = self.pending.lock().remove(&peer).is_some();
         if was_pending {
             log::info!("server: WS callEnded for {peer:?} (reason={reason:?}) — cancelling pending admission");
-            self.sink.send(SessionEvent::Failed { peer_id: peer });
+            self.sink.emit(SessionEvent::Failed { peer_id: peer });
         }
     }
 
@@ -538,7 +535,7 @@ impl<S: Signaling + ?Sized + 'static> ServerTunnelManager<S> {
 }
 
 fn spawn_server_watcher(
-    sink:     EventsSink,
+    sink:     EventsSink<SessionEvent>,
     registry: Arc<Mutex<HashMap<PeerId, Arc<LkTunnel>>>>,
     peer:     PeerId,
     tunnel:   Arc<LkTunnel>,
@@ -559,7 +556,7 @@ fn spawn_server_watcher(
                         break;
                     };
                     log::info!("server watcher: emitting Connected for {peer:?}");
-                    sink.send(SessionEvent::Connected { peer_id: peer.clone(), tunnel: t });
+                    sink.emit(SessionEvent::Connected { peer_id: peer.clone(), tunnel: t });
                 }
                 crate::EventKind::Disconnected => {
                     let mut map = registry.lock();
@@ -570,14 +567,14 @@ fn spawn_server_watcher(
                     drop(map);
                     if entered {
                         log::info!("server watcher: emitting Disconnected for {peer:?}");
-                        sink.send(SessionEvent::Disconnected { peer_id: peer.clone() });
+                        sink.emit(SessionEvent::Disconnected { peer_id: peer.clone() });
                     } else {
                         // Server-side: accepted but never reached
                         // Connected (handshake failed, peer never
                         // joined). Surface Failed so the consumer
                         // can clean up any pending UI for this peer.
                         log::info!("server watcher: emitting Failed for {peer:?}");
-                        sink.send(SessionEvent::Failed { peer_id: peer.clone() });
+                        sink.emit(SessionEvent::Failed { peer_id: peer.clone() });
                     }
                     break;
                 }

@@ -10,7 +10,7 @@ use crate::ws::{CallEntity, WsClient};
 
 use async_trait::async_trait;
 use lk_signaling::{
-    CallDecision, ContactPage, EndReason, IncomingHandler,
+    CallDecision, ContactPage, EndReason, EventsSink, IncomingHandler,
     PeerId, PlaceCallError, Signaling, SignalingError, SignalingEvent,
     TokenStore, TransportSession, TunnelHooks,
 };
@@ -44,11 +44,13 @@ pub struct BaleSignaling {
     /// invariant.
     peer_cache:   Mutex<HashMap<i32, PeerId>>,
 
-    /// Sender for the unified [`SignalingEvent`] stream. `None`
-    /// until [`Self::events`] is called. WS callbacks push
-    /// `AuthExpired` / `ProtocolObsolete` / `CallEnded` /
-    /// `ContactsChanged` here.
-    events_tx:        Mutex<Option<mpsc::UnboundedSender<SignalingEvent>>>,
+    /// Multi-consumer, lossless fan-out for the unified [`SignalingEvent`]
+    /// stream; [`Self::events`] hands out independent receivers. Lives from
+    /// construction so consumers wired up before the lifecycle catch every
+    /// event. WS callbacks push `AuthExpired` / `ProtocolObsolete` /
+    /// `CallEnded` / `ContactsChanged` here — app *and* each manager get
+    /// their own copy.
+    events:           EventsSink<SignalingEvent>,
     incoming_handler: Mutex<Option<ArcIncoming>>,
 
     /// `call_id → PeerId` for every call this instance is
@@ -78,15 +80,6 @@ pub struct BaleSignaling {
     /// active sessions in lock-step with either user-initiated
     /// teardown.
     teardown_count: tokio::sync::watch::Sender<u64>,
-    /// Multi-subscriber fan-out for `CallEnded` events surfaced
-    /// to managers via [`TunnelHooks::subscribe_call_ended`].
-    /// Separate from `events_tx` (which is single-consumer for
-    /// app use) so the [`crate::ClientTunnelManager`] /
-    /// [`crate::ServerTunnelManager`] can subscribe without
-    /// stealing the app's `events()` slot. Closed senders are
-    /// pruned on the next emit; the vec grows only with live
-    /// subscribers (one per manager).
-    call_ended_subs: Mutex<Vec<mpsc::UnboundedSender<(PeerId, EndReason)>>>,
 }
 
 /// RAII guard that removes a call_id from `in_flight_calls` on
@@ -111,13 +104,12 @@ impl BaleSignaling {
             http:                 grpc_web::build_client(),
             contact_cache:    Mutex::new(None),
             peer_cache:       Mutex::new(HashMap::new()),
-            events_tx:        Mutex::new(None),
+            events:           EventsSink::new(),
             incoming_handler: Mutex::new(None),
             active_peers:     Mutex::new(HashMap::new()),
             in_flight_calls:  Mutex::new(HashSet::new()),
             accepted_tx:      Mutex::new(None),
             teardown_count:   tokio::sync::watch::channel(0u64).0,
-            call_ended_subs:  Mutex::new(Vec::new()),
         });
         me.setup_ws_listeners();
         me.setup_auth_callbacks();
@@ -214,9 +206,8 @@ impl BaleSignaling {
     /// Push an event onto the unified [`Signaling::events`]
     /// stream. Silent no-op when no consumer is subscribed.
     fn emit_event(&self, ev: SignalingEvent) {
-        if let Some(tx) = self.events_tx.lock().as_ref() {
-            let _ = tx.send(ev);
-        }
+        // Fan out to every subscriber (app + managers); no-op if none yet.
+        self.events.emit(ev);
     }
 
     fn setup_ws_listeners(self: &Arc<Self>) {
@@ -345,15 +336,9 @@ impl BaleSignaling {
             return;
         };
         let reason = map_discard_reason(discard_reason);
-        // Fan out to manager subscribers first — prune any sender
-        // whose receiver was dropped so the vec doesn't grow.
-        self.call_ended_subs.lock().retain(|tx| {
-            tx.send((peer.clone(), reason.clone())).is_ok()
-        });
-        self.emit_event(SignalingEvent::CallEnded {
-            peer_id: peer,
-            reason,
-        });
+        // One stream now: app + managers all consume `events()` (broadcast)
+        // and match `CallEnded`. No separate manager fan-out.
+        self.emit_event(SignalingEvent::CallEnded { peer_id: peer, reason });
     }
 }
 
@@ -450,9 +435,7 @@ impl Signaling for BaleSignaling {
     }
 
     fn events(&self) -> mpsc::UnboundedReceiver<SignalingEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.events_tx.lock() = Some(tx);
-        rx
+        self.events.subscribe()
     }
 
     fn is_authenticated(&self) -> bool { self.token_store.load().is_some() }
@@ -593,12 +576,6 @@ impl TunnelHooks for BaleSignaling {
 
     fn subscribe_teardown(&self) -> tokio::sync::watch::Receiver<u64> {
         self.teardown_count.subscribe()
-    }
-
-    fn subscribe_call_ended(&self) -> mpsc::UnboundedReceiver<(PeerId, EndReason)> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.call_ended_subs.lock().push(tx);
-        rx
     }
 }
 
