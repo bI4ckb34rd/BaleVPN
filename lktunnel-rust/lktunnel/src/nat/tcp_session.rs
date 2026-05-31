@@ -15,6 +15,8 @@ use std::net::Shutdown;
 
 use mio::{Interest, Token};
 
+use bytes::Bytes;
+
 use crate::dispatcher::{self, EventHandler};
 use crate::nat_log;
 
@@ -166,12 +168,16 @@ struct OutSeg {
     sent_ms:       u32,
     retransmitted: bool,
     sacked:        bool,
-    data:          Vec<u8>,
-    options:       Vec<u8>,
+    // `Bytes` (not `Vec<u8>`) so the retransmit/TLP/recovery paths that
+    // pull a segment out to re-emit do a refcount bump on `.clone()`
+    // instead of a full payload copy. Filled once at capture.
+    data:          Bytes,
+    options:       Bytes,
 }
 
-// OOO ingress buffer entry.
-struct OooSeg { seq: u32, data: Vec<u8> }
+// OOO ingress buffer entry. `Bytes` so `deliver_ooo` can hand the
+// contiguous slice onward without re-copying.
+struct OooSeg { seq: u32, data: Bytes }
 
 pub struct TcpSession {
     pub key: FlowKey,
@@ -1256,8 +1262,8 @@ impl TcpSession {
                 sent_ms: now_ms(),
                 retransmitted: false,
                 sacked: false,
-                data: payload.to_vec(),
-                options: options.to_vec(),
+                data: Bytes::copy_from_slice(payload),
+                options: Bytes::copy_from_slice(options),
             };
             self.retx.push_back(s);
             let now = now_ms();
@@ -1561,7 +1567,7 @@ impl TcpSession {
             let next = &self.ooo[pos];
             if seq_lt(next.seq, seq.wrapping_add(data.len() as u32)) { return; }
         }
-        self.ooo.insert(pos, OooSeg { seq, data: data.to_vec() });
+        self.ooo.insert(pos, OooSeg { seq, data: Bytes::copy_from_slice(data) });
         self.ooo_bytes += data.len();
     }
 
@@ -1575,7 +1581,7 @@ impl TcpSession {
             }
             if seq_lt(self.rcv_nxt, head.seq) { break; }
             let skip = self.rcv_nxt.wrapping_sub(head.seq) as usize;
-            let data: Vec<u8> = head.data[skip..].to_vec();
+            let data: Bytes = head.data.slice(skip..);   // refcount, no copy
             let head_len = head.data.len();
             self.ooo_bytes -= head_len;
             self.ooo.pop_front();

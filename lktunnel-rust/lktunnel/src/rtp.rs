@@ -65,13 +65,16 @@ pub fn push_packed(batch: &mut Vec<u8>, packet: &[u8], max: usize) -> bool {
 /// trailer breaks the loop without erroring — the lossy carrier can
 /// deliver a corrupt frame and the transport above (QUIC) retransmits at
 /// L4.
-pub fn unpack(frame: &[u8], mut on_packet: impl FnMut(&[u8])) {
+pub fn unpack(frame: &bytes::Bytes, mut on_packet: impl FnMut(bytes::Bytes)) {
     let mut i = 0usize;
     while i + 2 <= frame.len() {
         let len = ((frame[i] as usize) << 8) | (frame[i + 1] as usize);
         i += 2;
         if len == 0 || i + len > frame.len() { break; }
-        on_packet(&frame[i..i + len]);
+        // `frame.slice(..)` is a zero-copy refcounted view into the same
+        // backing buffer the carrier handed us (webrtc's `read_rtp` payload),
+        // so per-packet dispatch doesn't copy the bytes back out.
+        on_packet(frame.slice(i..i + len));
         i += len;
     }
 }

@@ -1298,19 +1298,21 @@ async fn run_connect_task(
     // one is up (set by `enable_quic_*`). `on_quic` is built here (not in
     // a per-track attach) because the engine owns the single receive path.
     let quic_weak = std::sync::Weak::clone(&weak);
-    let on_quic: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |bytes: &[u8]| {
+    let on_quic: Arc<dyn Fn(bytes::Bytes) + Send + Sync> = Arc::new(move |bytes: bytes::Bytes| {
         let Some(inner) = quic_weak.upgrade() else { return };
         inner.counters.bump_rx(bytes.len());
         let tx = inner.quic_rx_tx.lock().clone();
         if let Some(tx) = tx {
             // Best-effort: a full receiver queue means quinn isn't
             // draining fast enough → drop, same as a UDP buffer overflow.
-            let _ = tx.try_send(bytes::Bytes::copy_from_slice(bytes));
+            // `bytes` is already a zero-copy slice of the carrier frame past
+            // the tag byte, so forward it straight in — no copy_from_slice.
+            let _ = tx.try_send(bytes);
         }
     });
-    let on_packet: Arc<dyn Fn(&[u8]) + Send + Sync> = {
+    let on_packet: Arc<dyn Fn(bytes::Bytes) + Send + Sync> = {
         let on_ip = Arc::clone(&on_ip);
-        Arc::new(move |payload: &[u8]| dispatch_payload(payload, &on_ip, &on_quic))
+        Arc::new(move |payload: bytes::Bytes| dispatch_payload(payload, &on_ip, &on_quic))
     };
 
     // Phase 1: join the SFU, bring up both PeerConnections, publish the
@@ -1628,9 +1630,9 @@ fn emit_event(
 /// Bytes arrive here from the RTP transformer's on_data observer
 /// (see [`rtp`]).
 fn dispatch_payload(
-    payload: &[u8],
+    payload: bytes::Bytes,
     on_ip:   &Arc<dyn Fn(&[u8]) + Send + Sync>,
-    on_quic: &Arc<dyn Fn(&[u8]) + Send + Sync>,
+    on_quic: &Arc<dyn Fn(bytes::Bytes) + Send + Sync>,
 ) {
     static DISPATCHED: AtomicU64 = AtomicU64::new(0);
     static IP_COUNT:   AtomicU64 = AtomicU64::new(0);
@@ -1644,7 +1646,7 @@ fn dispatch_payload(
     }
     match payload.first() {
         Some(&FRAME_TYPE_IP)   => { IP_COUNT.fetch_add(1, Ordering::Relaxed); on_ip(&payload[1..]) }
-        Some(&FRAME_TYPE_QUIC) => { QUIC_COUNT.fetch_add(1, Ordering::Relaxed); on_quic(&payload[1..]) }
+        Some(&FRAME_TYPE_QUIC) => { QUIC_COUNT.fetch_add(1, Ordering::Relaxed); on_quic(payload.slice(1..)) }
         Some(&other)           => log::debug!(
             "unknown frame type 0x{other:02x} (len={}) — dropping", payload.len()),
         None                   => {}

@@ -129,7 +129,7 @@ impl Engine {
         id: u64,
         url: &str,
         token: &str,
-        on_packet: Arc<dyn Fn(&[u8]) + Send + Sync>,
+        on_packet: Arc<dyn Fn(bytes::Bytes) + Send + Sync>,
     ) -> Result<(Arc<Engine>, Vec<Arc<RtpSender>>, tokio::sync::mpsc::UnboundedReceiver<EngineEvent>), String>
     {
         // ── Signal join (impersonate the JS SDK) ──────────────────────
