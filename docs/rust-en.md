@@ -61,6 +61,38 @@ chmod +x bale-vpn-*-*
 ./bale-vpn-headless-linux-x86_64 client            # client mode, SOCKS5 only
 ```
 
+### Install + manage with the helper script
+
+`scripts/balevpn.ps1` is a single bash + PowerShell polyglot that installs the headless binary and drives its HTTP API from an interactive menu — no manual download or `curl` needed.
+
+Raw script: <https://raw.githubusercontent.com/kookoo1sabzy/BaleVPN/main/scripts/balevpn.ps1>
+
+Download and run it in one line:
+
+```bash
+# Linux / macOS  (bash, not sh)
+curl -fsSL https://raw.githubusercontent.com/kookoo1sabzy/BaleVPN/main/scripts/balevpn.ps1 | bash
+```
+```powershell
+# Windows (PowerShell 5.1+ / 7+)
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/kookoo1sabzy/BaleVPN/main/scripts/balevpn.ps1 | iex
+```
+
+Use `bash`, not `sh` — the script relies on bash features. When piped it reads prompts from your terminal (`/dev/tty`) and installs the binary into the current directory. From a checkout, run `bash scripts/balevpn.ps1` or `.\scripts\balevpn.ps1` and it installs next to the script instead.
+
+On first run it downloads the matching `bale-vpn-headless-<os>-<arch>` for your OS/arch from the latest release into its own directory, starts it headless, and opens an **arrow-key menu** (↑/↓ move, Enter selects, ← or Esc goes back). The status header refreshes live — including a server-mode alert when a new admission request arrives — and if a mode is already configured the menu opens straight into it. From there you sign in (SMS OTP or paste an `access_token`), pick a server peer (client), or manage admission — pending / allow-list / block-list / max-clients / connected clients (server). A plain run **attaches** to an already-running binary instead of starting a second one; the menu also offers Start / Stop / Restart / Upgrade.
+
+| Flag | Effect |
+|---|---|
+| `--version vX.Y.Z` | Install a specific release instead of the latest. |
+| `--port <int>` | Management port (default 3001). |
+| `--mode client\|server`, `--nat-mode kernel\|userspace` | Pin mode / NAT at launch (otherwise set from the menu; `--nat-mode` needs `--mode server`). |
+| `--upgrade`, `--reinstall` | Stop the running binary, re-download, restart. |
+| `--restart`, `--stop` | Restart, or stop-and-exit. |
+| `--logs` | Tail the binary's log and exit. |
+
+The binary, its log (`bale-vpn.log`), and the config it writes (`.bale-vpn_config.json`) all live next to the script. The bash path needs `curl` + `jq`; the PowerShell path needs nothing extra.
+
 ### Command-line arguments
 
 The CLI uses subcommands so per-mode flags only appear under the right branch:

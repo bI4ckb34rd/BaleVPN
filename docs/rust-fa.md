@@ -63,6 +63,38 @@ chmod +x bale-vpn-*-*
 ./bale-vpn-headless-linux-x86_64 client            # حالت کلاینت، فقط SOCKS5
 ```
 
+### نصب و مدیریت با اسکریپت کمکی
+
+`scripts/balevpn.ps1` یک فایل واحد polyglot (هم bash و هم PowerShell) است که باینری headless را نصب می‌کند و از طریق یک منوی تعاملی با HTTP API آن کار می‌کند — بدون دانلود دستی یا `curl`.
+
+اسکریپت خام: <https://raw.githubusercontent.com/kookoo1sabzy/BaleVPN/main/scripts/balevpn.ps1>
+
+دانلود و اجرا در یک خط:
+
+```bash
+# لینوکس / مک  (با bash، نه sh)
+curl -fsSL https://raw.githubusercontent.com/kookoo1sabzy/BaleVPN/main/scripts/balevpn.ps1 | bash
+```
+```powershell
+# ویندوز (PowerShell 5.1+ / 7+)
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/kookoo1sabzy/BaleVPN/main/scripts/balevpn.ps1 | iex
+```
+
+از `bash` استفاده کنید، نه `sh` — اسکریپت به امکانات bash متکی است. هنگام pipe، ورودی منو از ترمینال (`/dev/tty`) خوانده می‌شود و باینری در دایرکتوری جاری نصب می‌شود. از روی یک checkout، `bash scripts/balevpn.ps1` یا `.\scripts\balevpn.ps1` را اجرا کنید تا کنار اسکریپت نصب شود.
+
+در اولین اجرا، نسخهٔ مناسب `bale-vpn-headless-<os>-<arch>` را برای OS/معماری شما از آخرین ریلیز در کنار خودش دانلود می‌کند، آن را به‌صورت headless اجرا می‌کند و یک **منوی کلیدهای جهت‌دار** باز می‌کند (بالا/پایین حرکت، Enter انتخاب، ← یا Esc بازگشت). سرصفحهٔ وضعیت به‌صورت زنده به‌روز می‌شود — از جمله هشدار حالت سرور وقتی درخواست پذیرش جدیدی می‌رسد — و اگر حالتی از قبل تنظیم شده باشد، منو مستقیماً وارد همان حالت می‌شود. از همان‌جا وارد می‌شوید (کد پیامکی یا چسباندن `access_token`)، در حالت کلاینت peer انتخاب می‌کنید، یا در حالت سرور پذیرش را مدیریت می‌کنید — در انتظار / لیست مجاز / لیست مسدود / حداکثر کلاینت / کلاینت‌های متصل. اجرای ساده به‌جای راه‌اندازی نمونهٔ دوم، به باینریِ در حال اجرا **متصل** می‌شود؛ منو گزینه‌های Start / Stop / Restart / Upgrade هم دارد.
+
+| فلگ | کار |
+|---|---|
+| `--version vX.Y.Z` | نصب نسخهٔ مشخص به‌جای آخرین. |
+| `--port <int>` | پورت مدیریت (پیش‌فرض ۳۰۰۱). |
+| `--mode client\|server`، `--nat-mode kernel\|userspace` | تثبیت حالت / NAT هنگام راه‌اندازی (وگرنه از منو؛ `--nat-mode` به `--mode server` نیاز دارد). |
+| `--upgrade`، `--reinstall` | توقف باینری در حال اجرا، دانلود مجدد، راه‌اندازی دوباره. |
+| `--restart`، `--stop` | راه‌اندازی مجدد، یا توقف و خروج. |
+| `--logs` | نمایش زندهٔ لاگ باینری و خروج. |
+
+باینری، لاگ آن (`bale-vpn.log`) و فایل پیکربندی‌ای که می‌سازد (`.bale-vpn_config.json`) همگی کنار اسکریپت قرار می‌گیرند. مسیر bash به `curl` و `jq` نیاز دارد؛ مسیر PowerShell به چیز اضافه‌ای نیاز ندارد.
+
 ### آرگومان‌های خط فرمان
 
 CLI از ساب‌فرمان استفاده می‌کند تا پرچم‌های مخصوصِ هر حالت فقط زیر شاخهٔ درست ظاهر شوند:
