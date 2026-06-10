@@ -1,11 +1,17 @@
-//! SOCKS5 ↔ QUIC bridge.
+//! SOCKS5 / HTTP-CONNECT ↔ QUIC bridge.
 //!
-//! Client-side: the LAN-facing peer runs a SOCKS5 listener; each
-//! accepted SOCKS5 connection is mapped to a freshly-opened QUIC
+//! Client-side: the LAN-facing peer runs a single listener that
+//! auto-detects the proxy protocol from the first byte — `0x05` is
+//! SOCKS5, anything else is treated as an HTTP `CONNECT` request (the
+//! two never collide: HTTP opens with an ASCII method verb). Each
+//! accepted connection is mapped to a freshly-opened QUIC
 //! bidirectional stream on the QUIC connection that runs over this
 //! tunnel. The stream's first bytes carry a SOCKS5-style target
 //! envelope; the rest is raw application bytes shuttled between the
-//! SOCKS5 client TCP and the QUIC stream.
+//! proxy client TCP and the QUIC stream. Only the CONNECT method is
+//! handled on the HTTP side (tunnelling — i.e. all HTTPS); plain
+//! forward-proxying of `http://` requests is not supported, point
+//! such clients at the SOCKS5 side instead.
 //!
 //! Server-side: the peer that bridges to the internet runs a QUIC
 //! stream acceptor. For each incoming stream it reads the target
@@ -253,7 +259,7 @@ pub(crate) async fn enable_listener(
                             drop(tcp);
                             return;
                         };
-                        if let Err(e) = pump_socks5_conn(tcp, conn).await {
+                        if let Err(e) = pump_conn(tcp, conn).await {
                             log::debug!("socks5: per-conn ended: {e}");
                         }
                     });
@@ -347,19 +353,44 @@ pub(crate) fn spawn_server_acceptor(server: QuicServer) -> QuicServerHandle {
 
 // ── Per-connection / per-stream pumps ─────────────────────────────────
 
-/// Client side: SOCKS5 handshake → open QUIC bidi stream → send
-/// target envelope → **wait for 1-byte server status** → reply with
-/// matching SOCKS5 code → byte-copy both directions.
-///
-/// The server status byte uses SOCKS5's own `REP_*` codes so we can
-/// translate verbatim into the SOCKS5 reply without a mapping table:
-///   0x00 = SUCCEEDED
-///   0x01 = general failure
-///   0x02 = blocked by ruleset (our SSRF guard)
-///   0x03 = network unreachable
-///   0x04 = host unreachable
-///   0x05 = connection refused
-///   0x07 = command not supported  (used here for "blocked target")
+/// Which proxy protocol a client connection spoke. Both end up at the
+/// same QUIC dispatch; they differ only in how the local handshake is
+/// parsed and how the connect result is reported back to the client.
+#[derive(Clone, Copy)]
+enum FrontProto { Socks5, HttpConnect }
+
+impl FrontProto {
+    /// The bytes to write back to the proxy client for a given server
+    /// status (a SOCKS5 `REP_*` code). `REP_SUCCEEDED` means the byte
+    /// copy is about to begin.
+    fn reply(self, status: u8) -> Vec<u8> {
+        match self {
+            FrontProto::Socks5 => {
+                vec![SOCKS_VER, status, RSV, ATYP_IPV4, 0, 0, 0, 0, 0, 0]
+            }
+            FrontProto::HttpConnect => http_connect_reply(status).to_vec(),
+        }
+    }
+}
+
+/// Per-connection entry point. Peeks the first byte (without consuming
+/// it) to pick the proxy protocol, then hands off to the matching
+/// front-end. `0x05` is the SOCKS5 version byte; every HTTP request
+/// starts with an ASCII method verb, so there is no overlap.
+async fn pump_conn(tcp: TcpStream, conn: quinn::Connection) -> io::Result<()> {
+    let mut first = [0u8; 1];
+    let n = tcp.peek(&mut first).await?;
+    if n == 0 {
+        return Ok(());  // client closed before sending anything
+    }
+    if first[0] == SOCKS_VER {
+        pump_socks5_conn(tcp, conn).await
+    } else {
+        pump_http_connect(tcp, conn).await
+    }
+}
+
+/// SOCKS5 front-end: handshake → `Target` → shared QUIC dispatch.
 async fn pump_socks5_conn(
     mut tcp: TcpStream,
     conn:    quinn::Connection,
@@ -375,6 +406,49 @@ async fn pump_socks5_conn(
         }
     };
     log::debug!("socks5: dispatching {target}");
+    dispatch_target(tcp, conn, target, FrontProto::Socks5).await
+}
+
+/// HTTP-CONNECT front-end: parse the `CONNECT host:port` request line
+/// → `Target` → shared QUIC dispatch. Only the CONNECT method is
+/// supported; anything else is answered with `400 Bad Request`.
+async fn pump_http_connect(
+    mut tcp: TcpStream,
+    conn:    quinn::Connection,
+) -> io::Result<()> {
+    let target = match read_http_connect_request(&mut tcp).await {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tcp.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+            ).await;
+            return Err(e);
+        }
+    };
+    log::debug!("http-connect: dispatching {target}");
+    dispatch_target(tcp, conn, target, FrontProto::HttpConnect).await
+}
+
+/// Shared back half for both front-ends: open a QUIC bidi stream →
+/// send the target envelope → **wait for the server's 1-byte status**
+/// → report it back to the proxy client in its own dialect → byte-copy
+/// both directions.
+///
+/// The server status byte uses SOCKS5's own `REP_*` codes so we can
+/// translate verbatim without a mapping table:
+///   0x00 = SUCCEEDED
+///   0x01 = general failure
+///   0x02 = blocked by ruleset (our SSRF guard)
+///   0x03 = network unreachable
+///   0x04 = host unreachable
+///   0x05 = connection refused
+///   0x07 = command not supported  (used here for "blocked target")
+async fn dispatch_target(
+    mut tcp: TcpStream,
+    conn:    quinn::Connection,
+    target:  Target,
+    proto:   FrontProto,
+) -> io::Result<()> {
     let (mut send, mut recv) = conn.open_bi().await
         .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset,
                                     format!("quic open_bi: {e}")))?;
@@ -383,20 +457,16 @@ async fn pump_socks5_conn(
         .map_err(|e| io::Error::new(io::ErrorKind::Other,
                                     format!("quic write env: {e}")))?;
 
-    // Wait for the server's 1-byte status BEFORE replying to the
-    // SOCKS5 client. Reading from a quinn::RecvStream blocks until
-    // bytes arrive or the stream resets; if the server fails before
-    // writing, the read errors and we report failure faithfully.
+    // Wait for the server's 1-byte status BEFORE replying to the proxy
+    // client. Reading from a quinn::RecvStream blocks until bytes
+    // arrive or the stream resets; if the server fails before writing,
+    // the read errors and we report failure faithfully.
     let mut status = [0u8; 1];
     let status_byte = match recv.read_exact(&mut status).await {
         Ok(()) => status[0],
         Err(_) => REP_GENERAL_FAILURE,  // server stream died → fail
     };
-    let reply = [
-        SOCKS_VER, status_byte, RSV, ATYP_IPV4,
-        0, 0, 0, 0, 0, 0,
-    ];
-    tcp.write_all(&reply).await?;
+    tcp.write_all(&proto.reply(status_byte)).await?;
     if status_byte != REP_SUCCEEDED {
         // No host TCP on the other end — close the stream cleanly
         // and return without spawning the byte-copy tasks.
@@ -617,6 +687,108 @@ where R: tokio::io::AsyncRead + Unpin
     }
 }
 
+// ── HTTP CONNECT helpers ──────────────────────────────────────────────
+
+/// Cap on the request head we'll buffer before giving up. CONNECT
+/// requests are tiny; anything past this is malformed or hostile.
+const MAX_HTTP_HEAD: usize = 16 * 1024;
+
+/// Read an HTTP request head up to the terminating `CRLFCRLF` and
+/// parse a `CONNECT host:port` request line into a [`Target`]. Reads
+/// one byte at a time so we never consume tunnel payload past the
+/// header block — after a CONNECT the client waits for our `200`
+/// before sending anything, but a byte-exact reader is robust either
+/// way. Generic over the stream so unit tests can drive it via
+/// `tokio::io::duplex`.
+async fn read_http_connect_request<S>(s: &mut S) -> io::Result<Target>
+where S: tokio::io::AsyncRead + Unpin
+{
+    let mut head = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = s.read(&mut byte).await?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                                      "eof before end of http request head"));
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > MAX_HTTP_HEAD {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                      "http request head too large"));
+        }
+    }
+
+    // Request line: METHOD SP request-target SP HTTP/x.y
+    let line_end = head.windows(2).position(|w| w == b"\r\n")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
+                                      "no request line"))?;
+    let line = std::str::from_utf8(&head[..line_end])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData,
+                                    "non-utf8 request line"))?;
+    let mut parts = line.split(' ');
+    let method = parts.next().unwrap_or("");
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        return Err(io::Error::new(io::ErrorKind::Unsupported,
+                                  "only CONNECT supported"));
+    }
+    let authority = parts.next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
+                                      "missing CONNECT target"))?;
+    parse_authority(authority)
+}
+
+/// Split a CONNECT authority (`host:port`, `[v6]:port`, or a bare host
+/// defaulting to 443) into a [`Target`]. An IP literal becomes
+/// `Target::Ip` so the server skips a needless DNS lookup; a name
+/// becomes `Target::Domain` and is resolved on the far side.
+fn parse_authority(authority: &str) -> io::Result<Target> {
+    let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        // Bracketed IPv6 literal: [addr] or [addr]:port
+        let close = rest.find(']').ok_or_else(|| bad("unterminated ipv6 literal"))?;
+        let addr = &rest[..close];
+        let port = match &rest[close + 1..] {
+            "" => 443,
+            after => after.strip_prefix(':')
+                .ok_or_else(|| bad("junk after ipv6 literal"))?
+                .parse::<u16>().map_err(|_| bad("bad port"))?,
+        };
+        (addr.to_string(), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(),
+                             p.parse::<u16>().map_err(|_| bad("bad port"))?),
+            None => (authority.to_string(), 443),
+        }
+    };
+    if host.is_empty() {
+        return Err(bad("empty host"));
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) => Ok(Target::Ip(ip, port)),
+        Err(_) => Ok(Target::Domain(host, port)),
+    }
+}
+
+/// Map a server status byte (SOCKS5 `REP_*` code) to the HTTP response
+/// we hand the CONNECT client. Success is the canonical
+/// `200 Connection Established`; failures collapse to a few standard
+/// gateway statuses.
+fn http_connect_reply(status: u8) -> &'static [u8] {
+    match status {
+        REP_SUCCEEDED => b"HTTP/1.1 200 Connection Established\r\n\r\n",
+        REP_RULESET_BLOCKED =>
+            b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n",
+        REP_NETWORK_UNREACHABLE | REP_HOST_UNREACHABLE =>
+            b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n",
+        _ =>
+            b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n",
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -833,5 +1005,76 @@ mod tests {
         let mut cursor = std::io::Cursor::new(bad);
         let err = read_target(&mut cursor).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// HTTP CONNECT to a domain target with explicit port.
+    #[tokio::test]
+    async fn http_connect_domain() {
+        let req = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(req.to_vec());
+        match read_http_connect_request(&mut cursor).await.unwrap() {
+            Target::Domain(d, port) => {
+                assert_eq!(d, "example.com");
+                assert_eq!(port, 443);
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
+    }
+
+    /// HTTP CONNECT to a bracketed IPv6 literal → Target::Ip.
+    #[tokio::test]
+    async fn http_connect_ipv6_literal() {
+        let req = b"CONNECT [2001:db8::1]:8443 HTTP/1.1\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(req.to_vec());
+        match read_http_connect_request(&mut cursor).await.unwrap() {
+            Target::Ip(IpAddr::V6(a), port) => {
+                assert_eq!(a, "2001:db8::1".parse::<Ipv6Addr>().unwrap());
+                assert_eq!(port, 8443);
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
+    }
+
+    /// Bare host with no port defaults to 443.
+    #[tokio::test]
+    async fn http_connect_default_port() {
+        let target = parse_authority("example.com").unwrap();
+        match target {
+            Target::Domain(d, port) => {
+                assert_eq!(d, "example.com");
+                assert_eq!(port, 443);
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
+    }
+
+    /// An IPv4 literal authority parses to Target::Ip (server skips DNS).
+    #[tokio::test]
+    async fn http_connect_ipv4_literal() {
+        match parse_authority("192.0.2.7:993").unwrap() {
+            Target::Ip(IpAddr::V4(a), port) => {
+                assert_eq!(a.octets(), [192, 0, 2, 7]);
+                assert_eq!(port, 993);
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
+    }
+
+    /// A non-CONNECT method is rejected as Unsupported.
+    #[tokio::test]
+    async fn http_connect_rejects_get() {
+        let req = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(req.to_vec());
+        let err = read_http_connect_request(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// Success status maps to the canonical 200 line; failures don't.
+    #[tokio::test]
+    async fn http_connect_reply_mapping() {
+        assert!(http_connect_reply(REP_SUCCEEDED).starts_with(b"HTTP/1.1 200"));
+        assert!(http_connect_reply(REP_RULESET_BLOCKED).starts_with(b"HTTP/1.1 403"));
+        assert!(http_connect_reply(REP_HOST_UNREACHABLE).starts_with(b"HTTP/1.1 504"));
+        assert!(http_connect_reply(REP_CONNECTION_REFUSED).starts_with(b"HTTP/1.1 502"));
     }
 }
