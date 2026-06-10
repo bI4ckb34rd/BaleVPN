@@ -125,6 +125,16 @@ impl TunGateway {
         let alloc = [SERVER_NET_PREFIX[0], SERVER_NET_PREFIX[1],
                      SERVER_NET_PREFIX[2], lease];
         tunnel.set_on_ip(Some(Arc::new(move |pkt: &[u8]| {
+            // Destination policy — same SSRF / private-range / cloud-
+            // metadata filter the userspace NAT applies at socket-open.
+            // Kernel-TUN mode writes straight to the kernel for
+            // forwarding, so without this an admitted peer could reach
+            // 169.254.169.254 (cloud-metadata → instance creds), the
+            // server's RFC1918 LAN, or another peer's 10.8.0.x lease
+            // (10/8 is blocked, which covers the lease subnet too).
+            if drop_outbound(pkt) {
+                return;  // not v4 / too short / blocked destination — drop
+            }
             // Copy the slice so we can mutate the checksums + src.
             let mut buf = pkt.to_vec();
             if !ip_packet::rewrite_v4_src(&mut buf, alloc) {
@@ -194,6 +204,22 @@ impl Drop for TunGateway {
             self.close();
         }
     }
+}
+
+/// True if a peer's outbound packet must be dropped rather than
+/// forwarded to the kernel: non-IPv4, too short to carry an IPv4
+/// header, or a destination the SSRF / private-range filter blocks
+/// (cloud metadata, RFC1918 — incl. the `10.8.0.x` lease subnet —
+/// loopback, link-local, CGNAT, …). Mirrors the destination policy
+/// enforced on the userspace-NAT path so the two server modes can't
+/// diverge. The destination address sits at bytes 16..20 of the IPv4
+/// header regardless of IHL/options.
+fn drop_outbound(pkt: &[u8]) -> bool {
+    if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
+        return true;
+    }
+    let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    crate::nat::filter::is_blocked_dst(dst.into())
 }
 
 /// Read packets from the TUN, look up which tunnel each one belongs
@@ -273,4 +299,37 @@ fn tun_read_loop(gw: Arc<TunGatewayInner>) {
     }
 
     log::info!("tun gateway: read loop exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal IPv4 header (no options) addressed to `dst`.
+    fn pkt_to(dst: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45; // version 4, IHL 5
+        p[16..20].copy_from_slice(&dst);
+        p
+    }
+
+    #[test]
+    fn drop_outbound_blocks_ssrf_and_cross_peer() {
+        // Cloud metadata, server LAN, loopback, another peer's lease.
+        assert!(drop_outbound(&pkt_to([169, 254, 169, 254])));
+        assert!(drop_outbound(&pkt_to([192, 168, 1, 1])));
+        assert!(drop_outbound(&pkt_to([127, 0, 0, 1])));
+        assert!(drop_outbound(&pkt_to([10, 8, 0, 3])));   // peer-to-peer lease
+        // Public destinations are forwarded.
+        assert!(!drop_outbound(&pkt_to([8, 8, 8, 8])));
+        assert!(!drop_outbound(&pkt_to([1, 1, 1, 1])));
+    }
+
+    #[test]
+    fn drop_outbound_rejects_malformed() {
+        assert!(drop_outbound(&[0u8; 10]));          // too short for IPv4
+        let mut v6 = vec![0u8; 20];
+        v6[0] = 0x60;                                // version 6
+        assert!(drop_outbound(&v6));
+    }
 }
