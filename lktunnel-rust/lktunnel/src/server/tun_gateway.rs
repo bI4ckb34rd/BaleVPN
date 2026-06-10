@@ -219,6 +219,16 @@ fn drop_outbound(pkt: &[u8]) -> bool {
         return true;
     }
     let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    // Peer isolation: never forward a packet aimed at the VPN's own
+    // address pool (10.8.0.0/16 — every lease plus the gateway's own
+    // 10.8.0.1). One admitted peer must not be able to reach another
+    // peer's lease or the gateway through the shared TUN. Enforced
+    // independently of is_blocked_dst so peer-to-peer stays disabled
+    // even if an operator ever relaxes the private-range policy.
+    let o = dst.octets();
+    if o[0] == SERVER_NET_PREFIX[0] && o[1] == SERVER_NET_PREFIX[1] {
+        return true;
+    }
     crate::nat::filter::is_blocked_dst(dst.into())
 }
 
@@ -319,7 +329,10 @@ mod tests {
         assert!(drop_outbound(&pkt_to([169, 254, 169, 254])));
         assert!(drop_outbound(&pkt_to([192, 168, 1, 1])));
         assert!(drop_outbound(&pkt_to([127, 0, 0, 1])));
-        assert!(drop_outbound(&pkt_to([10, 8, 0, 3])));   // peer-to-peer lease
+        // Peer isolation across the whole 10.8.0.0/16 pool.
+        assert!(drop_outbound(&pkt_to([10, 8, 0, 3])));   // another peer's lease
+        assert!(drop_outbound(&pkt_to([10, 8, 5, 7])));   // another /24 in the pool
+        assert!(drop_outbound(&pkt_to([10, 8, 0, 1])));   // the gateway itself
         // Public destinations are forwarded.
         assert!(!drop_outbound(&pkt_to([8, 8, 8, 8])));
         assert!(!drop_outbound(&pkt_to([1, 1, 1, 1])));
