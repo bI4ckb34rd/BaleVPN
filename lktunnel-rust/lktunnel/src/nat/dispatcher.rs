@@ -250,8 +250,18 @@ impl NatDispatcher {
         let mut ok = true;
         for p in &e.parts {
             if p.off as u32 != expected { ok = false; break; }
-            payload[p.off as usize..p.off as usize + p.len as usize]
-                .copy_from_slice(&p.data);
+            // `payload` is sized to `total_len`, taken from the MF=0
+            // fragment's offset+len. A fragment can still sit *past*
+            // that end while remaining contiguous with the ones before
+            // it — the offset check above only rejects gaps/overlaps,
+            // not a tail that runs beyond total_len. A crafted set like
+            // {off=0 MF=1, off=200 MF=1, off=100 MF=0 (→total_len=200)}
+            // tiles contiguously to 300 but writes into a 200-byte
+            // buffer → OOB panic → process abort (panic=abort). Drop
+            // any part that wouldn't fit.
+            let end = p.off as usize + p.len as usize;
+            if end > payload.len() { ok = false; break; }
+            payload[p.off as usize..end].copy_from_slice(&p.data);
             expected = (p.off as u32) + (p.len as u32);
         }
         let proto = e.proto;
@@ -518,5 +528,45 @@ impl Drop for NatDispatcher {
         self.tcp.clear();
         self.udp.clear();
         nat_log!(target: TAG, "nat dispatcher sid={} down", self.sid);
+    }
+}
+
+#[cfg(test)]
+mod frag_tests {
+    use super::*;
+    use super::super::ip_addr::IpAddr;
+
+    /// Build one IPv4 UDP fragment. `off_units` is the fragment offset
+    /// in 8-byte units (so byte offset = off_units * 8).
+    fn frag(src: &IpAddr, dst: &IpAddr, ip_id: u16,
+            off_units: u16, payload: &[u8], more: bool) -> Vec<u8> {
+        let total = 20 + payload.len();
+        let mut pkt = vec![0u8; total];
+        write_ipv4_header_frag(&mut pkt, total as u16, L4::Udp as u8,
+                               src, dst, ip_id, off_units, more);
+        pkt[20..].copy_from_slice(payload);
+        pkt
+    }
+
+    /// Regression: a contiguous fragment set whose tail runs past the
+    /// total_len declared by the MF=0 fragment used to write out of
+    /// bounds in reassembly (→ panic → process abort). It must now be
+    /// dropped without panicking.
+    #[test]
+    fn frag_tail_past_total_len_does_not_panic() {
+        let emit: EmitFn = Arc::new(|_: &[u8]| true);
+        let mut d = NatDispatcher::new(1, emit);
+
+        let src = IpAddr::v4_from_bytes(&[10, 8, 0, 2]);
+        let dst = IpAddr::v4_from_bytes(&[8, 8, 8, 8]);
+        let body = [0u8; 80];
+
+        // off=0   (MF=1), off=160 (MF=1), off=80 (MF=0 → total_len=160).
+        // Sorted they tile contiguously 0→240, but total_len is 160, so
+        // the off=160 part runs past the 160-byte reassembly buffer.
+        assert!(d.process(&frag(&src, &dst, 42, 0,  &body, true)));
+        assert!(d.process(&frag(&src, &dst, 42, 20, &body, true)));
+        // Pre-fix this call panicked; post-fix it drops the stream.
+        let _ = d.process(&frag(&src, &dst, 42, 10, &body, false));
     }
 }
