@@ -644,6 +644,11 @@ fn encode_target(t: &Target) -> Vec<u8> {
             buf.extend_from_slice(&p.to_be_bytes());
         }
         Target::Domain(d, p) => {
+            // Invariant: every producer of Target::Domain caps the name
+            // at 255 bytes (SOCKS5 / envelope length fields are one byte;
+            // `parse_authority` rejects longer). `d.len() as u8` would
+            // silently truncate otherwise and desync the server parse.
+            debug_assert!(d.len() <= 255, "domain too long for envelope: {}", d.len());
             buf.push(ATYP_DOMAIN);
             buf.push(d.len() as u8);
             buf.extend_from_slice(d.as_bytes());
@@ -766,6 +771,15 @@ fn parse_authority(authority: &str) -> io::Result<Target> {
     };
     if host.is_empty() {
         return Err(bad("empty host"));
+    }
+    // The target envelope encodes a domain length in a single byte, so
+    // anything over 255 bytes would silently truncate in `encode_target`
+    // and desync the server's parse (it would read a short name, then
+    // misread the rest of the hostname as the port + payload stream).
+    // The SOCKS5 front-end can't produce this (its length field is one
+    // byte); only an HTTP CONNECT authority can. Reject it here.
+    if host.len() > 255 {
+        return Err(bad("hostname too long"));
     }
     match host.parse::<IpAddr>() {
         Ok(ip) => Ok(Target::Ip(ip, port)),
@@ -1056,6 +1070,21 @@ mod tests {
                 assert_eq!(a.octets(), [192, 0, 2, 7]);
                 assert_eq!(port, 993);
             }
+            other => panic!("unexpected target: {other:?}"),
+        }
+    }
+
+    /// A hostname longer than 255 bytes is rejected, not silently
+    /// truncated into the envelope (which would desync the server parse).
+    #[tokio::test]
+    async fn http_connect_rejects_overlong_host() {
+        let long_host = "a".repeat(256);
+        let err = parse_authority(&format!("{long_host}:443")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // 255 is exactly the max and must still be accepted.
+        let ok_host = "b".repeat(255);
+        match parse_authority(&format!("{ok_host}:443")).unwrap() {
+            Target::Domain(d, p) => { assert_eq!(d.len(), 255); assert_eq!(p, 443); }
             other => panic!("unexpected target: {other:?}"),
         }
     }
