@@ -113,6 +113,15 @@ pub struct NatDispatcher {
     /// Last scale we computed. Stored alongside the Arc so we can
     /// detect "grew by ≥ RWND_GREW_THRESHOLD" jumps and fan-out ACKs.
     last_rwnd_scale: u16,
+    /// Cross-thread stats snapshot. Written by `sweep_idle` on the
+    /// dispatcher thread (the only thread allowed to touch the session
+    /// tables); read by `flow_stats()` from the UI/JNI stats-poll
+    /// thread. Routing the stats read through this snapshot — instead
+    /// of iterating the live `tcp`/`udp` maps — is what keeps the poll
+    /// from racing `on_event`'s field mutations and `sweep_idle`'s
+    /// `remove`/`retain` (the session tables are mutated lock-free on
+    /// the dispatcher thread, so a cross-thread iteration would be UB).
+    flow_stats_snapshot: std::sync::Arc<parking_lot::Mutex<Stats>>,
 }
 
 impl NatDispatcher {
@@ -128,6 +137,7 @@ impl NatDispatcher {
             global_rwnd_scale: Arc::new(AtomicU16::new(GLOBAL_RWND_SCALE_FULL)),
             pressure_fn: None,
             last_rwnd_scale: GLOBAL_RWND_SCALE_FULL,
+            flow_stats_snapshot: std::sync::Arc::new(parking_lot::Mutex::new(Stats::default())),
         }
     }
 
@@ -483,9 +493,28 @@ impl NatDispatcher {
                 s.log_kernel_tcp_info();
             }
         }
+
+        // Refresh the cross-thread stats snapshot here, on the
+        // dispatcher thread — the only thread permitted to read the
+        // session tables. `flow_stats()` serves this cached value, so
+        // the UI/JNI poll never iterates the live maps concurrently
+        // with this sweep's `remove`/`retain` or an event handler's
+        // field writes.
+        let snap = self.compute_flow_stats();
+        *self.flow_stats_snapshot.lock() = snap;
     }
 
+    /// Cross-thread stats read — returns the snapshot last computed by
+    /// `sweep_idle` on the dispatcher thread. Safe to call from any
+    /// thread; does **not** touch the session tables.
     pub fn flow_stats(&self) -> Stats {
+        *self.flow_stats_snapshot.lock()
+    }
+
+    /// Walk the live session tables to build a fresh stats snapshot.
+    /// **Dispatcher-thread only** (invoked from `sweep_idle`); the
+    /// public, cross-thread `flow_stats()` reads the cached result.
+    fn compute_flow_stats(&self) -> Stats {
         let mut s = Stats::default();
         s.tcp_flows = self.tcp.len() as u32;
         s.udp_flows = self.udp.len() as u32;
