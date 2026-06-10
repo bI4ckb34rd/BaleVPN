@@ -651,7 +651,7 @@ impl TcpSession {
     fn process_time_wait(&mut self, flags: u8) -> bool {
         if (flags & TCP_FIN) != 0 {
             self.emit_ack();
-            self.time_wait_deadline_ms = now_ms() + 30_000;
+            self.time_wait_deadline_ms = now_ms().wrapping_add(30_000);
         }
         true
     }
@@ -846,7 +846,7 @@ impl TcpSession {
         self.rto_ms = (self.srtt / 8 + self.rttvar.max(1)).max(200).min(60_000);
     }
 
-    fn schedule_rto(&mut self, now: u32) { self.rto_deadline_ms = now + self.rto_ms; }
+    fn schedule_rto(&mut self, now: u32) { self.rto_deadline_ms = now.wrapping_add(self.rto_ms); }
 
     // ─── SACK parse / mark ─────────────────────────────────────────
     fn parse_sack_blocks(&mut self, opts: &[u8]) {
@@ -933,7 +933,7 @@ impl TcpSession {
         if self.snd_wnd == 0 && have_data {
             if self.zwp_deadline_ms == 0 {
                 self.zwp_interval_ms = self.rto_ms.max(200);
-                self.zwp_deadline_ms = now + self.zwp_interval_ms;
+                self.zwp_deadline_ms = now.wrapping_add(self.zwp_interval_ms);
             }
         } else {
             self.zwp_deadline_ms = 0;
@@ -948,7 +948,7 @@ impl TcpSession {
         }
         let mut pto = if self.rtt_init { self.srtt / 4 } else { 200 };
         pto = pto.max(10).min(self.rto_ms);
-        self.tlp_deadline_ms = now + pto;
+        self.tlp_deadline_ms = now.wrapping_add(pto);
     }
 
     fn fire_tlp(&mut self, now: u32) {
@@ -1059,7 +1059,7 @@ impl TcpSession {
                 + (if (s.flags & TCP_SYN) != 0 { 1 } else { 0 })
                 + (if (s.flags & TCP_FIN) != 0 { 1 } else { 0 });
             if !seq_lt(end_seq, rack_end_seq) { continue; }
-            let expiry = s.sent_ms + rack_rtt + reo_wnd;
+            let expiry = s.sent_ms.wrapping_add(rack_rtt).wrapping_add(reo_wnd);
             if (now.wrapping_sub(expiry) as i32) >= 0 {
                 to_emit.push(i);
             } else if next_deadline == 0 || (expiry.wrapping_sub(next_deadline) as i32) < 0 {
