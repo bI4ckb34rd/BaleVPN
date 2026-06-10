@@ -17,11 +17,15 @@
 //!     behaviour (broadcast amplification, multicast loops).
 //!   - **IPv6 ULA** (`fc00::/7`). Treat like RFC1918 — operator-LAN
 //!     ranges that shouldn't be accidentally reachable.
-//!
-//! Not blocked by default: RFC1918 (`10/8`, `172.16/12`, `192.168/16`).
-//! Server operators with intentional local-LAN access need them, and
-//! the tunnel's own subnet is a subset. The right place to layer that
-//! is a per-deployment denylist, not a hardcoded default.
+//!   - **RFC1918 private** (`10/8`, `172.16/12`, `192.168/16`) and
+//!     **CGNAT** (`100.64/10`, RFC 6598). A tunneled client has no
+//!     business reaching the exit host's own private network —
+//!     allowing it is lateral movement / SSRF into the operator's LAN
+//!     (router admin pages, internal services, other LAN hosts). The
+//!     filter gates the *destination* the host socket dials; the
+//!     tunnel's own `10.8.0.0/16` addresses are client *source*
+//!     addresses, never connect() destinations, so blocking `10/8`
+//!     here does not affect the tunnel.
 //!
 //! Called from the NAT host-socket open path (`tcp_session::open_host_socket`,
 //! `udp_session::open`) before the `TcpStream::connect` / `UdpSocket::connect`
@@ -46,14 +50,26 @@ fn is_blocked_v4(ip: Ipv4Addr) -> bool {
     // Use std-provided range tests where available. `is_link_local`
     // covers 169.254.0.0/16 (including cloud-metadata addresses).
     // `is_documentation` covers the TEST-NET ranges, which a real
-    // workload should never legitimately be reaching.
-    ip.is_unspecified()        // 0.0.0.0/8
+    // workload should never legitimately be reaching. `is_private`
+    // covers all three RFC1918 ranges.
+    ip.octets()[0] == 0        // 0.0.0.0/8 "this network" (incl. 0.0.0.0)
     || ip.is_loopback()        // 127.0.0.0/8
+    || ip.is_private()         // 10/8, 172.16/12, 192.168/16
+    || is_cgnat(ip)            // 100.64.0.0/10 (RFC 6598)
     || ip.is_link_local()      // 169.254.0.0/16
     || ip.is_broadcast()       // 255.255.255.255
     || ip.is_multicast()       // 224.0.0.0/4
     || ip.is_documentation()   // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
     || is_oracle_metadata(ip)  // 192.0.0.192/32
+}
+
+/// `100.64.0.0/10` — RFC 6598 shared/CGNAT address space. Carrier-grade
+/// NAT and operator-internal ranges that a tunneled client shouldn't
+/// reach through the exit. Not covered by `is_private`.
+#[inline]
+fn is_cgnat(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0xC0) == 64
 }
 
 /// Oracle Cloud Infrastructure publishes instance metadata on
@@ -149,13 +165,26 @@ mod tests {
     }
 
     #[test]
-    fn does_not_block_rfc1918_by_default() {
-        // Intentional: blocking these would break valid use cases
-        // (server with intentional LAN reach). Per-deployment
-        // denylists are the right surface for this.
-        assert!(!is_blocked_dst(v4("10.0.0.1")));
-        assert!(!is_blocked_dst(v4("172.16.0.1")));
-        assert!(!is_blocked_dst(v4("192.168.0.1")));
+    fn blocks_rfc1918() {
+        // A tunneled client must not reach the exit host's own private
+        // network — that's SSRF / lateral movement into the operator LAN.
+        assert!(is_blocked_dst(v4("10.0.0.1")));
+        assert!(is_blocked_dst(v4("10.8.0.1")));        // gateway-adjacent
+        assert!(is_blocked_dst(v4("172.16.0.1")));
+        assert!(is_blocked_dst(v4("172.31.255.254")));  // top of 172.16/12
+        assert!(is_blocked_dst(v4("192.168.0.1")));
+    }
+
+    #[test]
+    fn blocks_cgnat_and_this_network() {
+        // CGNAT 100.64.0.0/10 (RFC 6598) — boundaries and outside.
+        assert!(is_blocked_dst(v4("100.64.0.1")));
+        assert!(is_blocked_dst(v4("100.127.255.254")));
+        assert!(!is_blocked_dst(v4("100.63.255.255"))); // just below /10
+        assert!(!is_blocked_dst(v4("100.128.0.1")));    // just above /10
+        // 0.0.0.0/8 "this network", not just the unspecified address.
+        assert!(is_blocked_dst(v4("0.0.0.0")));
+        assert!(is_blocked_dst(v4("0.1.2.3")));
     }
 
     #[test]
