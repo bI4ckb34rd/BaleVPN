@@ -11,4 +11,10 @@ bale-vpn-android/**/*.iml
 *.jks
 *.keystore
 
+# Rust build output — every crate's target/ at any depth.
+target/
+
+# Generated Android native libs (built from the Rust shims).
+bale-vpn-android/rust/jniLibs/
+
 .DS_Store
