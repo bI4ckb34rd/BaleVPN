@@ -13,7 +13,7 @@ The Android app is a Kotlin Multiplatform VPN app that runs in either **client m
 
 ## 1 · Install and sign in
 
-Download the latest APK from the repository's [Releases](../../../releases) page and install it. Open the app, enter your phone number, confirm the SMS code, and sign in. **Do this on both devices.**
+[Download the latest APK](https://github.com/kookoo1sabzy/BaleVPN/releases/latest/download/BaleVpn-release.apk) and install it (or browse all builds on the [Releases](../../../releases) page). Open the app, enter your phone number, confirm the SMS code, and sign in. **Do this on both devices.**
 
 <p align="center"><img src="screens/01-login.jpg" alt="Login screen" width="320"></p>
 
